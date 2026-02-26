@@ -29,11 +29,28 @@ class TextModel:
         return train, test
 
     def fit(self, train_df: pd.DataFrame, text_col: str = "transcript", label_col: str = "label"):
-        X = train_df[text_col].fillna("")
+        # similar to ``evaluate``, guard against a DataFrame being returned
+        # when pandas finds multiple columns with the same name.  this can
+        # happen earlier in the pipeline if the original and cleaned versions
+        # of the transcript both end up as ``transcript`` in the dataframe.
+        X_col = train_df[text_col]
+        if isinstance(X_col, pd.DataFrame):
+            X = X_col.iloc[:, 0].fillna("")
+        else:
+            X = X_col.fillna("")
         y = train_df[label_col]
         self.pipeline.fit(X, y)
 
     def evaluate(self, test_df: pd.DataFrame, text_col: str = "transcript", label_col: str = "label") -> str:
+        """Return a scikit-learn classification report for the test set.
+
+        If ``test_df`` is empty we simply return a helpful message rather than
+        letting the vectorizer crash with a zero-sample error.  The caller can
+        decide whether to treat it as fatal.
+        """
+        if test_df.empty:
+            return "[no test data; evaluation skipped]"
+
         X_col = test_df[text_col]
         if isinstance(X_col, pd.DataFrame):
             X = X_col.iloc[:, 0].fillna("").tolist()

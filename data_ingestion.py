@@ -34,18 +34,38 @@ class DataIngestion:
     Important: labeling uses future returns after the transcript date. To avoid lookahead
     bias, the training/testing split must be done by time; this module only aligns data
     and produces labels — the `TextModel` will perform temporal splits for training.
+
+    Transcripts data may come with a ``company`` column (which is internally
+    renamed to ``ticker``) and/or timezone-aware ``date`` values; both are
+    handled transparently to match the format produced by the sample CSV file.
     """
 
     def __init__(self):
         pass
 
     def load_transcripts_csv(self, path: str) -> pd.DataFrame:
-        """Load transcripts CSV with at least columns: `company`, `date`, `transcript`.
+        """Load transcripts CSV with at least columns: `company` (or `ticker`),
+        `date`, `transcript`.
 
-        `date` should be parseable by pandas.to_datetime.
+        The ``date`` value may include a timezone offset (``-04:00`` in our sample
+        CSV); the returned ``DataFrame`` normalizes all timestamps to naive
+        ``datetime64`` values so that they can be merged cleanly with price data.
+
+        ``company`` is renamed to ``ticker`` internally so that it matches the
+        conventions used throughout the rest of the pipeline.  Any existing
+        ``ticker`` column is left unchanged.
         """
         df = pd.read_csv(path)
-        df["date"] = pd.to_datetime(df["date"])
+        # standardize timestamp and drop tz information if present
+        # some transcripts include mixed timezones ("-04:00", "-05:00");
+        # parsing with ``utc=True`` avoids pandas falling back to object dtype.
+        df["date"] = pd.to_datetime(df["date"], utc=True)
+        # once converted to UTC we can discard the tz info
+        df["date"] = df["date"].dt.tz_convert(None)
+
+        # transcripts files often use "company" rather than "ticker"
+        if "company" in df.columns and "ticker" not in df.columns:
+            df = df.rename(columns={"company": "ticker"})
         return df
 
     def load_stock_csv(self, path: str) -> pd.DataFrame:
@@ -190,7 +210,23 @@ class DataIngestion:
         t = transcripts.copy()
         p = prices.copy()
 
-        # normalize column names
+        # ensure transcript dates are naive datetimes (drop any tz info)
+        t["date"] = pd.to_datetime(t["date"])
+        try:
+            if getattr(t["date"].dt, "tz", None) is not None:
+                t["date"] = t["date"].dt.tz_convert(None)
+        except Exception:
+            pass
+
+        # transcripts files sometimes provide a ``company`` column instead of
+        # ``ticker``; the sample data uses "company" so normalize it early.
+        if "company" in t.columns and "ticker" not in t.columns:
+            t = t.rename(columns={"company": "ticker"})
+        # likewise allow the prices file to use either name
+        if "company" in p.columns and "ticker" not in p.columns:
+            p = p.rename(columns={"company": "ticker"})
+
+        # normalize column names for merging
         if "ticker" in t.columns and "ticker" in p.columns:
             merge_on = ["ticker"]
         else:

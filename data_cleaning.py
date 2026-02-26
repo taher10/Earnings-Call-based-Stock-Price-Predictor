@@ -35,4 +35,7 @@ class DataCleaning:
         # simple lemmatization using regex tokenization to avoid heavy NLTK downloads
         tokens = re.findall(r"\w+", text)
         lem = [self.lemmatizer.lemmatize(t) for t in tokens]
-        return " ".join(lem)
+        cleaned = " ".join(lem)
+        # collapse any remaining runs of whitespace (including newlines)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
