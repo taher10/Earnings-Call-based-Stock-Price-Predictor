@@ -89,73 +89,6 @@ class DataIngestion:
         data["date"] = pd.to_datetime(data["date"])
         return data[["date", "ticker", "close"]]
 
-    # scraping helper --------------------------------------------------
-    def fetch_transcripts_seekingalpha(self, ticker: str) -> pd.DataFrame:
-        """Scrape earnings call transcripts for *ticker* from SeekingAlpha.
-
-        SeekingAlpha publishes each transcript as a separate HTML page rather
-        than a bulk CSV, so this helper downloads the listing page, follows the
-        links, and returns a dataframe with columns ``company``, ``date``, and
-        ``transcript``.  You can then feed the returned ``DataFrame`` directly
-        into :meth:`align_and_label` or write it out with
-        ``df.to_csv(..., index=False)`` for later use.
-
-        This method requires the ``requests`` and ``beautifulsoup4`` packages
-        (added to ``requirements.txt``).  If they are not installed, an
-        ``ImportError`` is raised with installation instructions.
-        """
-        try:
-            import requests
-            from bs4 import BeautifulSoup
-        except ImportError as e:
-            raise ImportError(
-                "requests and beautifulsoup4 are required for fetching transcripts; "
-                "install with `pip install requests beautifulsoup4`"
-            ) from e
-
-        base = "https://seekingalpha.com"
-        url = f"{base}/symbol/{ticker}/earnings/transcripts"
-        # the site blocks simple bots; use a realistic browser UA and a session
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Referer": base,
-        }
-        session = requests.Session()
-        resp = session.get(url, headers=headers)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        rows = []
-        # the page uses `<a class="quoted" ...>` for each transcript link
-        for link in soup.select("a.quoted"):
-            href = link.get("href")
-            if not href:
-                continue
-            span = link.find_previous("span")
-            if span is None:
-                continue
-            date_str = span.get_text(strip=True)
-            try:
-                date = pd.to_datetime(date_str)
-            except Exception:
-                # skip rows with unparseable dates
-                continue
-            # fetch individual transcript page
-            page = requests.get(base + href, headers=headers)
-            page.raise_for_status()
-            page_soup = BeautifulSoup(page.text, "html.parser")
-            content = page_soup.select_one("div.article-content")
-            if not content:
-                continue
-            text = content.get_text("\n", strip=True)
-            rows.append({"company": ticker, "date": date, "transcript": text})
-        return pd.DataFrame(rows)
-
     def fetch_transcripts_earningscall(
         self,
         ticker: str,
@@ -187,6 +120,9 @@ class DataIngestion:
             raise ValueError(f"ticker {ticker} not found via earningscall")
 
         rows = []
+        # ``today`` as a timezone-naive timestamp; event dates may have
+        # tzinfo so we'll normalize both sides before comparing.
+        today = pd.Timestamp.utcnow().tz_convert(None)
         for ev in company.events():
             if years and ev.year not in years:
                 continue
@@ -198,8 +134,21 @@ class DataIngestion:
             date = ev.conference_date if ev.conference_date is not None else pd.to_datetime(
                 f"{ev.year}-{(ev.quarter - 1) * 3 + 1}-01"
             )
+            # skip transcripts dated in the future; many corporate calendars
+            # contain events scheduled well in advance which don't have an actual
+            # transcript yet.
+            if pd.to_datetime(date, utc=True).tz_convert(None) > today:
+                continue
             rows.append({"company": ticker, "date": date, "transcript": tr.text})
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            # normalize timezone information exactly like load_transcripts_csv
+            df["date"] = pd.to_datetime(df["date"], utc=True)
+            df["date"] = df["date"].dt.tz_convert(None)
+            # align column name with rest of pipeline
+            if "company" in df.columns and "ticker" not in df.columns:
+                df = df.rename(columns={"company": "ticker"})
+        return df
 
     def align_and_label(self, transcripts: pd.DataFrame, prices: pd.DataFrame, days_forward: int = 7, pct_threshold: float = 0.02) -> pd.DataFrame:
         """For each transcript, compute percent return over `days_forward` trading days and label.

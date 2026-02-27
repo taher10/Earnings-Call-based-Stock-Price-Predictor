@@ -75,9 +75,9 @@ def test_train_cli_with_defaults(capsys):
     from main import train
 
     # create a namespace mimicking argparse with defaults adjusted to point at
-    # the sample files.  we rely on main.py having the expected defaults for
-    # transcripts/prices; this simply exercises the early path and the empty
-    # test set logic added above.
+    # the sample files.  the code may attempt to auto-fetch transcripts if
+    # ``earningscall`` is installed; either way we should end up with at least
+    # one transcript row (the sample has three, and a fetch would yield more).
     ns = argparse.Namespace(
         transcripts=os.path.join(os.path.dirname(__file__), "..", "data", "sample_aapl_transcripts.csv"),
         prices=os.path.join(os.path.dirname(__file__), "..", "data", "sample_aapl_prices.csv"),
@@ -85,11 +85,50 @@ def test_train_cli_with_defaults(capsys):
         days_forward=7,
         pct_threshold=0.02,
         out_dir=os.path.join(os.path.dirname(__file__), "..", "models_test"),
+        fetch_ticker=None,
+        start_year=None,
+        end_year=None,
     )
-    # run train and capture stdout; should not raise
+    # run train and capture stdout; should not raise and should mention transcripts
     train(ns)
     out, err = capsys.readouterr()
+    assert "Auto-fetched" in out or "transcripts" in out
     assert "warning: no data after cutoff" in out
+
+    # verify the automatic transcripts file (if created) does not contain any
+    # future dates
+    import pandas as pd
+    path = os.path.join(os.path.dirname(__file__), "..", "models_test", "input_transcripts.csv")
+    if os.path.exists(path):
+        df2 = pd.read_csv(path)
+        if not df2.empty:
+            assert pd.to_datetime(df2["date"]).max() <= pd.to_datetime("today")
+
+
+def test_fetch_transcripts_cli(capsys):
+    """When --fetch-ticker is provided the pipeline should download data."""
+    import argparse
+    from main import train
+
+    ns = argparse.Namespace(
+        transcripts=None,
+        prices=os.path.join(os.path.dirname(__file__), "..", "data", "sample_aapl_prices.csv"),
+        train_until="2025-01-01",
+        days_forward=7,
+        pct_threshold=0.02,
+        out_dir=os.path.join(os.path.dirname(__file__), "..", "models_test"),
+        fetch_ticker="AAPL",
+        start_year=2021,
+        end_year=2022,
+    )
+    # running this test requires earningscall; skip gracefully if unavailable
+    try:
+        train(ns)
+    except ImportError:
+        # earningscall not available, nothing to assert
+        return
+    out, err = capsys.readouterr()
+    assert "Fetched" in out
 
 
 if __name__ == "__main__":
