@@ -66,6 +66,28 @@ def test_alignment_and_model_pipeline():
     report = tm.evaluate(test_df)
     assert isinstance(report, str)
 
+    # --- new functionality tests ------------------------------------------------
+    # helper methods for text indicators
+    assert di._has_future_outlook("we expect growth next quarter")
+    assert not di._has_future_outlook("we reported last quarter results")
+    assert di._count_numbers("revenue was $5.3 billion and margin 15%") >= 2
+
+    # align_with_window should compute a centred return on the tiny sample
+    window_df = di.align_with_window(transcripts, prices, days_before=1, days_after=1)
+    # because our sample only has two transcripts 3 months apart, returns may be NaN
+    assert "window_return" in window_df.columns
+
+    # proportion_split should divide by date order
+    df2 = pd.DataFrame({
+        "date": ["2020-01-01", "2020-02-01", "2020-03-01", "2020-04-01"],
+        "label": [0,1,0,1],
+        "transcript": ["a","b","c","d"],
+    })
+    train2, test2 = tm.proportion_split(df2, 0.5)
+    # first two rows (Jan, Feb) should be in train
+    assert len(train2) == 2 and all(pd.to_datetime(train2["date"]) <= pd.to_datetime("2020-02-01"))
+    assert len(test2) == 2
+
 
 def test_train_cli_with_defaults(capsys):
     """Ensure main.train can be invoked with default paths and handles missing
@@ -84,6 +106,11 @@ def test_train_cli_with_defaults(capsys):
         train_until="2099-01-01",  # far future ensures all rows land in train
         days_forward=7,
         pct_threshold=0.02,
+        days_before=5,
+        days_after=5,
+        split_frac=None,
+        require_outlook=False,
+        min_numeric=0,
         out_dir=os.path.join(os.path.dirname(__file__), "..", "models_test"),
         fetch_ticker=None,
         start_year=None,
@@ -94,6 +121,17 @@ def test_train_cli_with_defaults(capsys):
     out, err = capsys.readouterr()
     assert "Auto-fetched" in out or "transcripts" in out
     assert "warning: no data after cutoff" in out
+
+    # check that step files were created (even if empty)
+    base = os.path.join(os.path.dirname(__file__), "..", "models_test")
+    for fname in ["step1_transcripts.csv", "step2_window.csv", "step3_features.csv"]:
+        assert os.path.exists(os.path.join(base, fname)), f"{fname} missing"
+
+    # run again with an outlook requirement to force filtering
+    ns.require_outlook = True
+    train(ns)
+    out2, err2 = capsys.readouterr()
+    assert "Filtered" in out2
 
     # verify the automatic transcripts file (if created) does not contain any
     # future dates
@@ -116,6 +154,11 @@ def test_fetch_transcripts_cli(capsys):
         train_until="2025-01-01",
         days_forward=7,
         pct_threshold=0.02,
+        days_before=5,
+        days_after=5,
+        split_frac=None,
+        require_outlook=False,
+        min_numeric=0,
         out_dir=os.path.join(os.path.dirname(__file__), "..", "models_test"),
         fetch_ticker="AAPL",
         start_year=2021,
@@ -129,6 +172,9 @@ def test_fetch_transcripts_cli(capsys):
         return
     out, err = capsys.readouterr()
     assert "Fetched" in out
+    base = os.path.join(os.path.dirname(__file__), "..", "models_test")
+    for fname in ["step1_transcripts.csv", "step2_window.csv", "step3_features.csv"]:
+        assert os.path.exists(os.path.join(base, fname)), f"{fname} missing after fetch"
 
 
 if __name__ == "__main__":

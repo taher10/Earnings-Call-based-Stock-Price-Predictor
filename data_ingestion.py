@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Optional, List
 import pandas as pd
 
@@ -15,15 +16,6 @@ def _try_import_earningscall():
     try:
         import earningscall
         return earningscall
-    except Exception:
-        return None
-
-
-
-def _try_import_yfinance():
-    try:
-        import yfinance as yf
-        return yf
     except Exception:
         return None
 
@@ -88,6 +80,37 @@ class DataIngestion:
         data["ticker"] = ticker
         data["date"] = pd.to_datetime(data["date"])
         return data[["date", "ticker", "close"]]
+
+    def _has_future_outlook(self, text: str) -> bool:
+        """Return True if the transcript contains language suggesting a forward outlook.
+
+        The current heuristic looks for a small set of keywords that typically
+        appear when management is discussing guidance, expectations, or plans.  It
+        is intentionally lightweight so that the pipeline has no extra runtime
+        dependencies.
+        """
+        if not isinstance(text, str):
+            return False
+        keywords = [
+            r"\boutlook\b",
+            r"\bguidance\b",
+            r"\bforecast\b",
+            r"\bexpect\b",
+            r"\bplan\b",
+            r"\bproject\b",
+        ]
+        pattern = re.compile("|".join(keywords), flags=re.IGNORECASE)
+        return bool(pattern.search(text))
+
+    def _count_numbers(self, text: str) -> int:
+        """Count numeric mentions in the transcript (percentages, dollar figures, etc.).
+
+        This is a very loose proxy for how much quantitative information is present.
+        """
+        if not isinstance(text, str):
+            return 0
+        # look for digits possibly followed by % or common units (m, b, k)
+        return len(re.findall(r"\d+[\d\.]*\s*(%|billion|million|k|m)?", text, flags=re.IGNORECASE))
 
     def fetch_transcripts_earningscall(
         self,
@@ -218,4 +241,96 @@ class DataIngestion:
 
         labels = t.apply(label_row, axis=1)
         out = pd.concat([t.reset_index(drop=True), labels.reset_index(drop=True)], axis=1)
+
+        # annotate transcripts with a few simple text indicators that may be
+        # useful for filtering or model features.  the naming and logic here are
+        # deliberately conservative; you can expand the keyword list or adopt a
+        # library such as spaCy/VADER for richer sentiment scores later.
+        out["has_future_outlook"] = out["transcript"].fillna("").apply(self._has_future_outlook)
+        out["numeric_count"] = out["transcript"].fillna("").apply(self._count_numbers)
+
+        return out
+
+    def align_with_window(
+        self,
+        transcripts: pd.DataFrame,
+        prices: pd.DataFrame,
+        days_before: int = 5,
+        days_after: int = 5,
+    ) -> pd.DataFrame:
+        """Create a view of transcripts with a centred return window.
+
+        For each transcript row we locate the nearest available trading close
+        *on or after* ``date - days_before`` and the nearest trading close on
+        *or after* ``date + days_after``.  The resulting ``window_return`` is
+        computed as
+
+            (after_close - before_close) / before_close
+
+        Rows for which one of the bounding prices cannot be found are returned
+        with ``NaN`` in the return columns.  This allows you to inspect the
+        raw data before deciding how to handle missing values.
+        """
+        t = transcripts.copy()
+        p = prices.copy()
+
+        # normalize dates and tickers exactly like :meth:`align_and_label`
+        t["date"] = pd.to_datetime(t["date"])
+        try:
+            if getattr(t["date"].dt, "tz", None) is not None:
+                t["date"] = t["date"].dt.tz_convert(None)
+        except Exception:
+            pass
+
+        if "company" in t.columns and "ticker" not in t.columns:
+            t = t.rename(columns={"company": "ticker"})
+        if "company" in p.columns and "ticker" not in p.columns:
+            p = p.rename(columns={"company": "ticker"})
+
+        if "ticker" in t.columns and "ticker" in p.columns:
+            merge_on = ["ticker"]
+        else:
+            merge_on = []
+        p = p.sort_values([col for col in (merge_on + ["date"])])
+        p_lookup = p.set_index([*merge_on, "date"])["close"].sort_index()
+
+        def window_row(row):
+            key = tuple(row[c] for c in merge_on) if merge_on else None
+            dt = row["date"]
+            # helper to find the first close on/after a target date
+            def find_close(target):
+                if merge_on:
+                    subset = p.loc[
+                        (p[merge_on[0]] == row[merge_on[0]]) & (p["date"] >= target)
+                    ].sort_values("date")
+                else:
+                    subset = p.loc[p["date"] >= target].sort_values("date")
+                if subset.empty:
+                    return None
+                return subset.iloc[0]["close"]
+
+            before_target = dt - pd.Timedelta(days=days_before)
+            after_target = dt + pd.Timedelta(days=days_after)
+            before_close = find_close(before_target)
+            after_close = find_close(after_target)
+            if before_close is None or after_close is None:
+                return pd.Series({
+                    "before_close": None,
+                    "after_close": None,
+                    "window_return": None,
+                })
+            win_ret = (after_close - before_close) / before_close
+            return pd.Series({
+                "before_close": before_close,
+                "after_close": after_close,
+                "window_return": win_ret,
+            })
+
+        windows = t.apply(window_row, axis=1)
+        out = pd.concat([t.reset_index(drop=True), windows.reset_index(drop=True)], axis=1)
+
+        # also add the text indicators to mirror align_and_label
+        out["has_future_outlook"] = out["transcript"].fillna("").apply(self._has_future_outlook)
+        out["numeric_count"] = out["transcript"].fillna("").apply(self._count_numbers)
+
         return out

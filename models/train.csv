@@ -1,3 +1,1 @@
-date,ticker,future_return,label,transcript
-2020-01-28,AAPL,0.05,1.0,we had a strong quarter with higher service revenue and good iphone demand outlook is positive
-2020-04-30,AAPL,-0.039285714285714285,0.0,supply chain issue impacted production demand remains resilient but near term headwind exist
+ticker,date,before_close,after_close,window_return,has_future_outlook,numeric_count,future_return,label,transcript

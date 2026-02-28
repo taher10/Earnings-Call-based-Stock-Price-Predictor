@@ -21,9 +21,34 @@ class TextModel:
         ])
 
     def temporal_split(self, df: pd.DataFrame, train_until: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Split data by a cutoff date (inclusive train, exclusive test).
+
+        This is the original behaviour used by ``main.py`` and is necessary to
+        avoid look‑ahead bias when the user supplies an absolute timestamp as
+        ``--train-until``.  If you prefer an 80/20 pro rata split you can call
+        :meth:`proportion_split` instead.
+        """
         df2 = df.dropna(subset=["label", "transcript", "date"]).copy()
         df2["date"] = pd.to_datetime(df2["date"])
         cutoff = pd.to_datetime(train_until)
+        train = df2[df2["date"] <= cutoff].copy()
+        test = df2[df2["date"] > cutoff].copy()
+        return train, test
+
+    def proportion_split(self, df: pd.DataFrame, frac: float = 0.8) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Return a temporal split that places ``frac`` of the examples in train.
+
+        The split is performed on the sorted ``date`` column in order to maintain
+        the time‑series ordering; it is not a random shuffle.  ``frac`` must be
+        between 0 and 1.  The caller can choose this when an explicit cutoff date
+        isn’t known or when a simple 80/20 division is sufficient for prototyping.
+        """
+        if not 0 < frac < 1:
+            raise ValueError("frac must be between 0 and 1")
+        df2 = df.dropna(subset=["label", "transcript", "date"]).copy()
+        df2["date"] = pd.to_datetime(df2["date"])
+        df2 = df2.sort_values("date")
+        cutoff = df2["date"].quantile(frac)
         train = df2[df2["date"] <= cutoff].copy()
         test = df2[df2["date"] > cutoff].copy()
         return train, test

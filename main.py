@@ -19,6 +19,11 @@ def train(args):
 
     # load or fetch transcripts
     transcripts = None
+
+    # once we have transcripts, write the raw/normalized copy (step 1)
+    if transcripts is not None:
+        # we'll write later after load, so leave placeholder
+        pass
     if args.fetch_ticker:
         years = None
         if args.start_year is not None and args.end_year is not None:
@@ -50,6 +55,11 @@ def train(args):
         else:
             transcripts = di.load_transcripts_csv(args.transcripts)
 
+    # step 1: save normalized transcripts for inspection
+    if transcripts is not None:
+        transcripts.to_csv(out_dir / "step1_transcripts.csv", index=False)
+        print("Wrote step1_transcripts.csv")
+
 # if we auto-fetched transcripts and the user left the prices argument as
     # the sample file, it makes sense to also pull prices for the same ticker
     # via yfinance so that alignment actually produces rows.
@@ -80,7 +90,29 @@ def train(args):
     transcripts.to_csv(out_dir / "input_transcripts.csv", index=False)
     prices.to_csv(out_dir / "input_prices.csv", index=False)
 
-    df = di.align_and_label(transcripts, prices, days_forward=args.days_forward, pct_threshold=args.pct_threshold)
+    # compute window returns around each transcript (step 2)
+    df = di.align_with_window(
+        transcripts,
+        prices,
+        days_before=args.days_before,
+        days_after=args.days_after,
+    )
+    # translate window_return into the familiar future_return/label fields
+    df["future_return"] = df.get("window_return")
+    def _make_label(r):
+        try:
+            if r >= args.pct_threshold:
+                return 1
+            elif r <= -args.pct_threshold:
+                return 0
+            else:
+                return 2
+        except Exception:
+            return None
+    df["label"] = df["future_return"].apply(_make_label)
+
+    df.to_csv(out_dir / "step2_window.csv", index=False)
+    print("Wrote step2_window.csv")
 
     # prepare output directory early so we can write intermediate CSVs
     out_dir = Path(args.out_dir)
@@ -91,6 +123,16 @@ def train(args):
     df.to_csv(aligned_path, index=False)
     print("Wrote aligned data to", aligned_path)
 
+    # optionally drop transcripts that don’t meet simple text heuristics
+    if args.require_outlook or args.min_numeric > 0:
+        before = len(df)
+        if args.require_outlook:
+            df = df[df["has_future_outlook"]]
+        if args.min_numeric > 0:
+            df = df[df["numeric_count"] >= args.min_numeric]
+        after = len(df)
+        print(f"Filtered {before - after} rows based on text heuristics, leaving {after}")
+
     # clean transcripts – keep original until we've saved the cleaned version
     df["clean_transcript"] = df.get("transcript", pd.Series()).fillna("").apply(dc.clean_text)
     df_clean = df.drop(columns=[c for c in ["transcript"] if c in df.columns]).rename(columns={"clean_transcript": "transcript"})
@@ -99,11 +141,32 @@ def train(args):
     cleaned_path = out_dir / "cleaned.csv"
     df_clean.to_csv(cleaned_path, index=False)
     print("Wrote cleaned data to", cleaned_path)
+    # also save feature-ready CSV as step3
+    step3_path = out_dir / "step3_features.csv"
+    df_clean.to_csv(step3_path, index=False)
+    print("Wrote step3_features.csv")
 
-    # temporal split and train
-    train_df, test_df = tm.temporal_split(df_clean, args.train_until)
-    print(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
-    tm.fit(train_df)
+    # split and train
+    if args.split_frac is not None:
+        train_df, test_df = tm.proportion_split(df_clean, args.split_frac)
+        print(f"Proportional split {args.split_frac}: train {len(train_df)}, test {len(test_df)}")
+    else:
+        train_df, test_df = tm.temporal_split(df_clean, args.train_until)
+        print(f"Temporal split until {args.train_until}: train {len(train_df)}, test {len(test_df)}")
+
+    # show label distribution for diagnostics
+    if not train_df.empty:
+        print("label distribution (train):\n", train_df["label"].value_counts())
+        unique_labels = train_df["label"].dropna().unique()
+        if len(unique_labels) < 2:
+            print("warning: only one label present in training data; skipping model fit")
+            model_trained = False
+        else:
+            tm.fit(train_df)
+            model_trained = True
+    else:
+        print("warning: no training data after split; skipping model fit")
+        model_trained = False
 
     # write train/test CSVs for inspection
     train_path = out_dir / "train.csv"
@@ -112,32 +175,35 @@ def train(args):
     test_df.to_csv(test_path, index=False)
     print("Wrote train/test splits to", train_path, test_path)
 
-    if test_df.empty:
-        print("warning: no data after cutoff, skipping evaluation")
-        report = None
+    if not model_trained:
+        print("model was not trained; skipping evaluation and prediction steps")
     else:
-        report = tm.evaluate(test_df)
-        print("Evaluation:\n", report)
-        # save textual report for later inspection
-        eval_path = out_dir / "evaluation.txt"
-        with open(eval_path, "w") as fh:
-            fh.write(report)
-        print("Wrote evaluation to", eval_path)
+        if test_df.empty:
+            print("warning: no data after cutoff, skipping evaluation")
+            report = None
+        else:
+            report = tm.evaluate(test_df)
+            print("Evaluation:\n", report)
+            # save textual report for later inspection
+            eval_path = out_dir / "evaluation.txt"
+            with open(eval_path, "w") as fh:
+                fh.write(report)
+            print("Wrote evaluation to", eval_path)
 
-    # save predictions/probabilities to CSV when a test set exists
-    if not test_df.empty:
-        X = test_df["transcript"].fillna("").tolist()
-        preds = tm.pipeline.predict(X)
-        results = test_df.copy()
-        results["pred"] = preds
-        # include class probabilities if available
-        if hasattr(tm.pipeline, "predict_proba"):
-            probs = tm.pipeline.predict_proba(X)
-            for i, cls in enumerate(tm.pipeline.classes_):
-                results[f"prob_{cls}"] = probs[:, i]
-        results_path = out_dir / "results.csv"
-        results.to_csv(results_path, index=False)
-        print("Wrote prediction results to", results_path)
+        # save predictions/probabilities to CSV when a test set exists
+        if not test_df.empty:
+            X = test_df["transcript"].fillna("").tolist()
+            preds = tm.pipeline.predict(X)
+            results = test_df.copy()
+            results["pred"] = preds
+            # include class probabilities if available
+            if hasattr(tm.pipeline, "predict_proba"):
+                probs = tm.pipeline.predict_proba(X)
+                for i, cls in enumerate(tm.pipeline.classes_):
+                    results[f"prob_{cls}"] = probs[:, i]
+            results_path = out_dir / "results.csv"
+            results.to_csv(results_path, index=False)
+            print("Wrote prediction results to", results_path)
 
     # save model as before (pickle) for reuse, but the main deliverable is CSVs
     model_path = out_dir / "model.pkl"
@@ -188,6 +254,34 @@ if __name__ == '__main__':
     parser.add_argument("--train-until", dest="train_until", default="2020-06-01")
     parser.add_argument("--days-forward", type=int, default=7)
     parser.add_argument("--pct-threshold", type=float, default=0.02)
+    parser.add_argument(
+        "--days-before",
+        type=int,
+        default=5,
+        help="number of trading days before the transcript to include in return window",
+    )
+    parser.add_argument(
+        "--days-after",
+        type=int,
+        default=5,
+        help="number of trading days after the transcript to include in return window",
+    )
+    parser.add_argument(
+        "--split-frac",
+        type=float,
+        help="proportion of data to use for training (temporal order preserved); overrides --train-until if set",
+    )
+    parser.add_argument(
+        "--require-outlook",
+        action="store_true",
+        help="drop transcripts that lack forward‑looking language before splitting",
+    )
+    parser.add_argument(
+        "--min-numeric",
+        type=int,
+        default=0,
+        help="drop transcripts with fewer than this many numeric mentions",
+    )
     parser.add_argument("--out-dir", default="models")
     args = parser.parse_args()
 
@@ -198,4 +292,3 @@ if __name__ == '__main__':
         if not os.path.isfile(path):
             parser.error(f"specified {name} file does not exist: {path}")
     train(args)
-
