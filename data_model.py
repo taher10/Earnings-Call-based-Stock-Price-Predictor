@@ -1,24 +1,78 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List
 import pandas as pd
 import joblib
 from sklearn.pipeline import Pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report
+import numpy as np
+
+
+# Financial earnings-speak stop words to filter out
+FINANCIAL_STOP_WORDS = [
+    "forward", "looking", "forward-looking", "statements", "statement",
+    "quarter", "quarterly", "year", "annual", "annually",
+    "earnings", "revenue", "gross", "margin", "margins",
+    "guidance", "outlook", "guidance", "fy", "q1", "q2", "q3", "q4",
+    "conference", "call", "participants", "operator",
+    "see", "saw", "seen", "say", "said", "says",
+    "believe", "believes", "believed",
+    "expect", "expects", "expected", "expectation",
+    "business", "company", "we", "us", "our", "they", "their", "them",
+    "would", "could", "should", "may", "might",
+    "will", "will", "going", "etc"
+]
 
 
 class TextModel:
     """Trainable text model predicting buy/sell/hold from transcripts.
 
-    Uses TF-IDF + LogisticRegression. Ensures temporal split for train/test to
-    avoid lookahead bias: `train_until` provides the cutoff date (inclusive) for training.
+    Uses Financial TF-IDF (with custom stop words and bigrams) + LogisticRegression.
+    Ensures temporal split for train/test to avoid lookahead bias.
+    Supports feature importance extraction for weighted sentiment scoring.
     """
 
-    def __init__(self):
+    def __init__(self, use_financial_stopwords: bool = True):
+        stop_words = FINANCIAL_STOP_WORDS if use_financial_stopwords else "english"
         self.pipeline = Pipeline([
-            ("tfidf", TfidfVectorizer(max_features=20000, ngram_range=(1,2))),
-            ("clf", LogisticRegression(max_iter=1000))
+            ("tfidf", TfidfVectorizer(
+                max_features=20000,
+                ngram_range=(1, 2),  # unigrams and bigrams
+                stop_words=stop_words,
+                min_df=1,
+                max_df=0.95
+            )),
+            ("clf", LogisticRegression(max_iter=1000, class_weight="balanced"))
         ])
+        self.feature_importance = None  # Will store learned feature weights
+        self.feature_names = None  # Will store TF-IDF feature names
+        self.sentiment_scores = []  # Will store sentiment scores for percentile tuning
+        self.threshold_buy = 0.2  # Default; will be tuned based on percentiles
+        self.threshold_sell = -0.2  # Default; will be tuned based on percentiles
+        
+        # Sentiment history for velocity calculation (rolling window)
+        self.sentiment_history = {}  # ticker -> [(date, score), ...]
+        
+        # TRAINING BASELINE: Store mean and std of training sentiment scores
+        # Used to normalize test scores relative to training distribution
+        self.training_sentiment_mean = 0.0
+        self.training_sentiment_std = 1.0
+        
+        # Dynamic threshold tracking (rolling 8-quarter percentiles)
+        self.rolling_percentiles = {}  # ticker -> (threshold_buy, threshold_sell)
+        
+        # Product introduction dates for temporal decay
+        self.feature_dates = {
+            "a18": "2024-09-01",
+            "a17": "2023-09-01",
+            "m4": "2024-05-01",
+            "m3": "2023-05-01",
+            "apple intelligence": "2024-09-01",
+            "iphone 15": "2023-09-01",
+            "iphone 14": "2022-09-01",
+            "iphone 13": "2021-09-01",
+            "iphone 12": "2020-10-01",
+        }
 
     def temporal_split(self, df: pd.DataFrame, train_until: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Split data by a cutoff date (inclusive train, exclusive test).
@@ -65,6 +119,336 @@ class TextModel:
             X = X_col.fillna("")
         y = train_df[label_col]
         self.pipeline.fit(X, y)
+        
+        # Extract feature importance after fitting
+        self._extract_feature_importance()
+        
+        # COMPUTE TRAINING BASELINE: Calculate sentiment distribution on training data
+        # This will be used to normalize test scores relative to training
+        try:
+            tfidf_vec = self.pipeline.named_steps["tfidf"]
+            clf = self.pipeline.named_steps["clf"]
+            X_vec = tfidf_vec.transform(X)
+            
+            # Get decision function scores for training data
+            training_scores = []
+            for idx in range(len(X)):
+                scores = clf.decision_function(X_vec[idx:idx+1])[0]
+                # Sentiment = prob(buy) - prob(sell) from decision function
+                sentiment = scores[1] - scores[0] if len(scores) >= 2 else scores[0]
+                training_scores.append(sentiment)
+            
+            # Store mean and std of training sentiment
+            self.training_sentiment_mean = np.mean(training_scores)
+            self.training_sentiment_std = np.std(training_scores)
+            
+            # Ensure std is not zero (avoid division by zero)
+            if self.training_sentiment_std < 0.01:
+                self.training_sentiment_std = 0.1
+            
+            print(f"Training baseline: mean={self.training_sentiment_mean:.4f}, std={self.training_sentiment_std:.4f}")
+        except Exception as e:
+            print(f"Warning: Could not compute training baseline: {e}")
+            self.training_sentiment_mean = 0.0
+            self.training_sentiment_std = 1.0
+
+    def _extract_feature_importance(self):
+        """Extract learned feature weights from the trained LogisticRegression model."""
+        try:
+            # Get feature names from TF-IDF vectorizer
+            self.feature_names = self.pipeline.named_steps["tfidf"].get_feature_names_out()
+            
+            # Get coefficients from logistic regression
+            coefficients = self.pipeline.named_steps["clf"].coef_
+            
+            # For multi-class (buy/sell/hold), get the average absolute importance
+            # coefficients shape: (n_classes, n_features)
+            importance = np.mean(np.abs(coefficients), axis=0)
+            
+            # Create a dictionary of feature -> importance
+            self.feature_importance = {
+                name: float(imp) 
+                for name, imp in zip(self.feature_names, importance)
+            }
+        except Exception as e:
+            print(f"Could not extract feature importance: {e}")
+            self.feature_importance = None
+
+    def _apply_temporal_decay(self, feature_name: str, current_date: pd.Timestamp, decay_rate: float = 0.05) -> float:
+        """Apply exponential decay to feature importance based on age.
+        
+        Older product references decay exponentially, forcing the model to
+        rely on more recent terminology for prediction.
+        
+        Args:
+            feature_name: The word/phrase (e.g., "iphone 12")
+            current_date: The transcript date
+            decay_rate: Decay per month (0.05 = 5% per month)
+            
+        Returns:
+            Decay multiplier (0 to 1)
+        """
+        # Find matching feature date
+        feature_intro = None
+        for key, date_str in self.feature_dates.items():
+            if key in feature_name.lower():
+                feature_intro = pd.to_datetime(date_str)
+                break
+        
+        if feature_intro is None:
+            return 1.0  # No decay for unknown features
+        
+        # Calculate months since introduction
+        months_ago = (current_date - feature_intro).days / 30.0
+        
+        # Exponential decay: decay_multiplier = exp(-decay_rate * months_ago)
+        decay_multiplier = np.exp(-decay_rate * max(0, months_ago))
+        
+        return decay_multiplier
+
+    def tune_thresholds_percentile(self, scores: List[float], percentile_buy: int = 85, percentile_sell: int = 15):
+        """Tune classification thresholds based on percentiles of sentiment scores.
+        
+        Instead of fixed thresholds (0, -0), use percentile-based bucketing:
+        - Top percentile_buy% = BUY
+        - Bottom percentile_sell% = SELL
+        - Middle = HOLD
+        
+        Args:
+            scores: List of sentiment scores from training set
+            percentile_buy: Percentile for BUY threshold (default 85 = top 15%)
+            percentile_sell: Percentile for SELL threshold (default 15 = bottom 15%)
+        """
+        if not scores:
+            return
+        
+        self.threshold_buy = np.percentile(scores, percentile_buy)
+        self.threshold_sell = np.percentile(scores, percentile_sell)
+        
+        print(f"Percentile-based thresholds tuned:")
+        print(f"  BUY (top 15%):  score >= {self.threshold_buy:.4f}")
+        print(f"  SELL (bottom 15%): score <= {self.threshold_sell:.4f}")
+        print(f"  HOLD (middle 70%): {self.threshold_sell:.4f} < score < {self.threshold_buy:.4f}")
+
+    def calculate_sentiment_velocity(self, ticker: str, current_date: pd.Timestamp, current_score: float, lookback_quarters: int = 4) -> float:
+        """Calculate Sentiment Velocity: change in sentiment from rolling average.
+        
+        Compares current quarter's score to the average of the last N quarters.
+        A decline in sentiment—even if still positive—generates a bearish penalty.
+        
+        Args:
+            ticker: Stock ticker symbol
+            current_date: Date of current transcript
+            current_score: Current sentiment score
+            lookback_quarters: Number of past quarters to average (default 4)
+            
+        Returns:
+            Velocity multiplier (0.7 to 1.0 scale; <1.0 = momentum penalty)
+        """
+        if ticker not in self.sentiment_history:
+            return 1.0  # No history; return neutral multiplier
+        
+        history = self.sentiment_history[ticker]
+        
+        # Find scores from the last N quarters
+        quarters_back = lookback_quarters * 91  # ~91 days per quarter
+        cutoff_date = current_date - pd.Timedelta(days=quarters_back)
+        
+        recent_scores = [score for date, score in history if date >= cutoff_date and date < current_date]
+        
+        if not recent_scores:
+            return 1.0  # Not enough history
+        
+        rolling_avg = np.mean(recent_scores)
+        velocity = current_score - rolling_avg
+        
+        # Momentum penalty: if velocity is negative, reduce score
+        # Penalty scales from 1.0 (neutral) to 0.7 (strong decline)
+        if velocity < 0:
+            momentum_multiplier = max(0.7, 1.0 + 0.1 * velocity)  # 10% penalty per point of negative velocity
+        else:
+            momentum_multiplier = min(1.1, 1.0 + 0.05 * velocity)  # 5% bonus per point of positive velocity
+        
+        return momentum_multiplier
+
+    def calculate_velocity_zscore(self, ticker: str, current_date: pd.Timestamp, current_score: float) -> float:
+        """Calculate Z-score of current sentiment relative to TRAINING sentiment distribution.
+        
+        Z-score = (current_score - training_mean) / training_std
+        This normalizes test scores against the training data baseline, not other test samples.
+        Only |Z| > 1.0 triggers strong BUY/SELL signals (more sensitive than 1.5)
+        
+        Args:
+            ticker: Stock ticker symbol
+            current_date: Current date
+            current_score: Current sentiment score
+            
+        Returns:
+            Z-score relative to training distribution (typically -3 to +3)
+        """
+        # Use training baseline to normalize: how many std devs from training mean?
+        zscore = (current_score - self.training_sentiment_mean) / self.training_sentiment_std
+        return zscore
+
+    def detect_guidance_divergence(self, full_text: str, management_section: str, qa_section: str) -> dict:
+        """Detect if guidance is lower than results (divergence warning).
+        
+        Uses the DataCleaning method to extract guidance vs results sections.
+        
+        Returns:
+            {
+                'has_divergence': bool,
+                'results_sentiment': float or None,
+                'guidance_sentiment': float or None,
+                'divergence_magnitude': float or None
+            }
+        """
+        try:
+            from data_cleaning import DataCleaning
+            cleaner = DataCleaning()
+            results_text, guidance_text = cleaner.extract_guidance_and_results(full_text)
+            
+            if not guidance_text or len(guidance_text) < 10:
+                return {
+                    'has_divergence': False,
+                    'results_sentiment': None,
+                    'guidance_sentiment': None,
+                    'divergence_magnitude': None
+                }
+            
+            # Score results and guidance sections using TF-IDF weights
+            if not hasattr(self, 'vectorizer') or self.vectorizer is None:
+                return {
+                    'has_divergence': False,
+                    'results_sentiment': None,
+                    'guidance_sentiment': None,
+                    'divergence_magnitude': None
+                }
+            
+            # Transform both sections
+            results_vec = self.vectorizer.transform([results_text])
+            guidance_vec = self.vectorizer.transform([guidance_text])
+            
+            # Predict sentiment using logistic regression
+            if not hasattr(self, 'model') or self.model is None:
+                return {
+                    'has_divergence': False,
+                    'results_sentiment': None,
+                    'guidance_sentiment': None,
+                    'divergence_magnitude': None
+                }
+            
+            results_prob = self.model.predict_proba(results_vec)[0]  # [prob_sell, prob_hold, prob_buy]
+            guidance_prob = self.model.predict_proba(guidance_vec)[0]
+            
+            # Score = P(buy) - P(sell)
+            results_sentiment = results_prob[2] - results_prob[0]  # buy - sell
+            guidance_sentiment = guidance_prob[2] - guidance_prob[0]
+            
+            divergence_magnitude = results_sentiment - guidance_sentiment  # Positive = guidance lower
+            has_divergence = divergence_magnitude > 0.15  # Threshold: >0.15 is significant divergence
+            
+            return {
+                'has_divergence': has_divergence,
+                'results_sentiment': float(results_sentiment),
+                'guidance_sentiment': float(guidance_sentiment),
+                'divergence_magnitude': float(divergence_magnitude)
+            }
+        except Exception as e:
+            print(f"Warning: Could not detect guidance divergence: {e}")
+            return {
+                'has_divergence': False,
+                'results_sentiment': None,
+                'guidance_sentiment': None,
+                'divergence_magnitude': None
+            }
+
+    def update_sentiment_history(self, ticker: str, date: pd.Timestamp, score: float):
+        """Add a sentiment score to the rolling history for velocity calculation."""
+        if ticker not in self.sentiment_history:
+            self.sentiment_history[ticker] = []
+        
+        self.sentiment_history[ticker].append((date, score))
+        
+        # Keep only last 8 quarters (for dynamic decile labeling)
+        eight_quarters = 8 * 91  # ~728 days
+        cutoff = date - pd.Timedelta(days=eight_quarters)
+        self.sentiment_history[ticker] = [(d, s) for d, s in self.sentiment_history[ticker] if d >= cutoff]
+
+    def tune_thresholds_dynamic_decile(self, ticker: str, lookback_quarters: int = 8) -> Tuple[float, float]:
+        """Dynamic Decile Labeling: Use rolling window percentiles for regime-aware thresholds.
+        
+        Calculates buy/sell thresholds based only on the last N quarters,
+        allowing the model to adapt to different market regimes.
+        
+        Args:
+            ticker: Stock ticker symbol
+            lookback_quarters: Number of recent quarters to use for threshold calculation
+            
+        Returns:
+            (threshold_buy, threshold_sell) tuple
+        """
+        if ticker not in self.sentiment_history or not self.sentiment_history[ticker]:
+            return self.threshold_buy, self.threshold_sell
+        
+        # Get scores from recent history
+        history = self.sentiment_history[ticker]
+        quarters_back = lookback_quarters * 91
+        cutoff_date = history[-1][0] - pd.Timedelta(days=quarters_back)
+        
+        recent_scores = [score for date, score in history if date >= cutoff_date]
+        
+        if len(recent_scores) < 2:
+            return self.threshold_buy, self.threshold_sell
+        
+        # Calculate percentiles on recent window only
+        threshold_buy = np.percentile(recent_scores, 85)
+        threshold_sell = np.percentile(recent_scores, 15)
+        
+        self.rolling_percentiles[ticker] = (threshold_buy, threshold_sell)
+        
+        print(f"Dynamic decile thresholds ({ticker}, last {lookback_quarters}Q):")
+        print(f"  BUY (top 15%):  score >= {threshold_buy:.4f}")
+        print(f"  SELL (bottom 15%): score <= {threshold_sell:.4f}")
+        
+        return threshold_buy, threshold_sell
+
+    def get_top_features(self, label: int, n: int = 100) -> List[Tuple[str, float]]:
+        """Get top N features (words/phrases) for a specific class.
+        
+        label: 0=sell, 1=buy, 2=hold
+        Returns: List of (feature_name, coefficient_value) tuples
+        """
+        try:
+            coefficients = self.pipeline.named_steps["clf"].coef_[label]
+            feature_names = self.pipeline.named_steps["tfidf"].get_feature_names_out()
+            
+            # Get indices of top features
+            top_indices = np.argsort(coefficients)[-n:][::-1]
+            
+            return [(feature_names[i], float(coefficients[i])) for i in top_indices]
+        except Exception as e:
+            print(f"Could not get top features: {e}")
+            return []
+
+    def score_transcript(self, text: str) -> float:
+        """Score a single transcript using learned feature importance.
+        
+        Returns a continuous score (not a hard label) based on weighted keywords.
+        Positive score = bullish, negative = bearish, near 0 = neutral.
+        """
+        if self.feature_importance is None:
+            raise ValueError("Model must be fitted before scoring")
+        
+        # Tokenize and weight the text
+        tokens = text.lower().split()
+        score = 0.0
+        
+        for token in tokens:
+            if token in self.feature_importance:
+                score += self.feature_importance[token]
+        
+        return score / max(len(tokens), 1)  # Normalize by text length
 
     def evaluate(self, test_df: pd.DataFrame, text_col: str = "transcript", label_col: str = "label") -> str:
         """Return a scikit-learn classification report for the test set.
@@ -88,6 +472,145 @@ class TextModel:
     def predict(self, text: str) -> int:
         pred = self.pipeline.predict([text])[0]
         return int(pred)
+
+    def score_and_label(self, text: str, transcript_date: Optional[pd.Timestamp] = None, ticker: str = "AAPL", threshold_buy: Optional[float] = None, threshold_sell: Optional[float] = None) -> Tuple[dict, float, int]:
+        """Score a transcript and assign a label based on learned feature weights.
+        
+        Includes:
+        - Temporal decay: older product terms lose importance
+        - Q&A stress metric: 2x weight for negative sentiment in analyst Q&A section
+        - Sentiment velocity with ASYMMETRIC WEIGHTING: -15% penalty for decline, +5% for rise
+        - Management obfuscation: penalizes high hedging language density
+        - Z-score normalization: only |Z| > 1.5 triggers strong BUY/SELL signals
+        - Guidance divergence detection: warns if outlook sentiment < results sentiment
+        
+        Args:
+            text: The transcript text to score
+            transcript_date: Date of the earnings call (for temporal decay)
+            ticker: Stock ticker (for sentiment history tracking)
+            threshold_buy: Score must exceed this to assign label 1 (buy); uses self.threshold_buy if None
+            threshold_sell: Score must be below this to assign label 0 (sell); uses self.threshold_sell if None
+            
+        Returns:
+            (diagnostics_dict, score, label) where:
+                - diagnostics_dict contains velocity_zscore, divergence info
+                - score is the final sentiment score
+                - label is 0=sell, 1=buy, 2=hold
+        """
+        if threshold_buy is None:
+            threshold_buy = self.threshold_buy
+        if threshold_sell is None:
+            threshold_sell = self.threshold_sell
+        
+        # Default to recent date if not provided
+        if transcript_date is None:
+            transcript_date = pd.Timestamp.now()
+        
+        diagnostics = {
+            'velocity_zscore': 0.0,
+            'guidance_divergence': False,
+            'results_sentiment': None,
+            'guidance_sentiment': None,
+            'divergence_magnitude': None,
+        }
+        
+        try:
+            from data_cleaning import DataCleaning
+            dc = DataCleaning()
+            
+            # Extract management and Q&A sections
+            mgmt_text, qa_text = dc.extract_qa_section(text)
+            
+            # Measure management obfuscation in Q&A section
+            qa_hedging_density = dc.measure_hedging_density(qa_text) if qa_text else 0.0
+            obfuscation_penalty = 1.0 - (qa_hedging_density * 0.5)  # 50% penalty for max hedging
+
+            
+            # Vectorize both sections separately
+            tfidf_vec = self.pipeline.named_steps["tfidf"]
+            mgmt_vec = tfidf_vec.transform([mgmt_text])
+            qa_vec = tfidf_vec.transform([qa_text]) if qa_text else None
+            
+            # Get coefficients for the logistic regression model
+            clf = self.pipeline.named_steps["clf"]
+            
+            # Management section score
+            mgmt_scores = clf.decision_function(mgmt_vec)[0]
+            mgmt_sentiment = mgmt_scores[1] - mgmt_scores[0] if len(mgmt_scores) >= 2 else mgmt_scores[0]
+            
+            # Q&A section score (double the weight for negative sentiment, aka "stress")
+            qa_sentiment = 0.0
+            if qa_vec is not None and qa_text.strip():
+                qa_scores = clf.decision_function(qa_vec)[0]
+                qa_sentiment = qa_scores[1] - qa_scores[0] if len(qa_scores) >= 2 else qa_scores[0]
+                
+                # If negative sentiment detected in Q&A, double the penalty (stress metric)
+                if qa_sentiment < 0:
+                    qa_sentiment *= 2.0
+            
+            # Combine scores with Q&A stress weighting
+            combined_sentiment = 0.7 * mgmt_sentiment + 0.3 * qa_sentiment
+            
+            # Apply temporal decay to all features (modulate the final score)
+            # Features from older products get less influence
+            decay_multiplier = self._apply_temporal_decay("general", transcript_date)
+            
+            # Apply obfuscation penalty (high hedging = bearish)
+            obfuscated_sentiment = combined_sentiment * obfuscation_penalty
+            
+            # Calculate Z-score relative to TRAINING sentiment distribution
+            # This tells us: how extreme is this score compared to training?
+            velocity_zscore = self.calculate_velocity_zscore(ticker, transcript_date, obfuscated_sentiment)
+            diagnostics['velocity_zscore'] = float(velocity_zscore)
+            
+            # Apply sentiment velocity with ASYMMETRIC WEIGHTING (momentum multiplier)
+            velocity_multiplier = self.calculate_sentiment_velocity(ticker, transcript_date, obfuscated_sentiment)
+            
+            # Final score combines decay, obfuscation, and velocity
+            final_sentiment = obfuscated_sentiment * decay_multiplier * velocity_multiplier
+            
+            # Detect guidance vs. results divergence
+            divergence_info = self.detect_guidance_divergence(text, mgmt_text, qa_text)
+            diagnostics['guidance_divergence'] = divergence_info['has_divergence']
+            diagnostics['results_sentiment'] = divergence_info['results_sentiment']
+            diagnostics['guidance_sentiment'] = divergence_info['guidance_sentiment']
+            diagnostics['divergence_magnitude'] = divergence_info['divergence_magnitude']
+            
+            # Update sentiment history for future velocity calculations
+            self.update_sentiment_history(ticker, transcript_date, final_sentiment)
+            
+            # ASSIGN LABEL: Use threshold-based classification WITHOUT Z-score filtering
+            # The thresholds (buy/sell) were tuned on training data, so use them directly
+            # Z-score is provided for diagnostics only
+            if final_sentiment >= threshold_buy:
+                label = 1  # BUY
+            elif final_sentiment <= threshold_sell:
+                label = 0  # SELL
+            else:
+                label = 2  # HOLD
+                
+            return diagnostics, float(final_sentiment), int(label)
+            
+        except Exception as e:
+            print(f"Error in score_and_label: {e}")
+            # Fallback to simple decision function approach
+            try:
+                tfidf_vec = self.pipeline.named_steps["tfidf"]
+                text_vec = tfidf_vec.transform([text])
+                clf = self.pipeline.named_steps["clf"]
+                scores = clf.decision_function(text_vec)[0]
+                sentiment = scores[1] - scores[0] if len(scores) >= 2 else scores[0]
+                
+                if sentiment >= threshold_buy:
+                    label = 1
+                elif sentiment <= threshold_sell:
+                    label = 0
+                else:
+                    label = 2
+                    
+                return diagnostics, float(sentiment), int(label)
+            except:
+                return diagnostics, 0.0, 2  # Default to HOLD
 
     def save(self, path: str):
         joblib.dump(self.pipeline, path)

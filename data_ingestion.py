@@ -261,8 +261,8 @@ class DataIngestion:
         """Create a view of transcripts with a centred return window.
 
         For each transcript row we locate the nearest available trading close
-        *on or after* ``date - days_before`` and the nearest trading close on
-        *or after* ``date + days_after``.  The resulting ``window_return`` is
+        on the transcript date (before_close) and the nearest trading close on
+        *or after* ``date + days_after`` (after_close).  The resulting ``window_return`` is
         computed as
 
             (after_close - before_close) / before_close
@@ -297,8 +297,8 @@ class DataIngestion:
         def window_row(row):
             key = tuple(row[c] for c in merge_on) if merge_on else None
             dt = row["date"]
-            # helper to find the first close on/after a target date
-            def find_close(target):
+            # helper to find close on or after a target date
+            def find_close_after(target):
                 if merge_on:
                     subset = p.loc[
                         (p[merge_on[0]] == row[merge_on[0]]) & (p["date"] >= target)
@@ -307,12 +307,24 @@ class DataIngestion:
                     subset = p.loc[p["date"] >= target].sort_values("date")
                 if subset.empty:
                     return None
-                return subset.iloc[0]["close"]
+                return float(subset.iloc[0]["close"])
 
-            before_target = dt - pd.Timedelta(days=days_before)
+            # helper to find close on or before a target date
+            def find_close_before(target):
+                if merge_on:
+                    subset = p.loc[
+                        (p[merge_on[0]] == row[merge_on[0]]) & (p["date"] <= target)
+                    ].sort_values("date", ascending=False)
+                else:
+                    subset = p.loc[p["date"] <= target].sort_values("date", ascending=False)
+                if subset.empty:
+                    return None
+                return float(subset.iloc[0]["close"])
+
+            before_target = dt  # Use the transcript date itself - find most recent close on/before this date
             after_target = dt + pd.Timedelta(days=days_after)
-            before_close = find_close(before_target)
-            after_close = find_close(after_target)
+            before_close = find_close_before(before_target)
+            after_close = find_close_after(after_target)
             if before_close is None or after_close is None:
                 return pd.Series({
                     "before_close": None,
