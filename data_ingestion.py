@@ -81,6 +81,20 @@ class DataIngestion:
         data["date"] = pd.to_datetime(data["date"])
         return data[["date", "ticker", "close"]]
 
+    def fetch_spy_prices(self, start: str, end: str) -> pd.DataFrame:
+        """Fetch daily close prices for SPY (S&P 500 ETF) to use as market benchmark.
+        
+        Returns DataFrame with columns `date`, `close` (no ticker column).
+        This requires `yfinance` to be installed; if not installed, raises ImportError.
+        """
+        yf = _try_import_yfinance()
+        if yf is None:
+            raise ImportError("yfinance is required for fetch_spy_prices; install with `pip install yfinance`")
+        data = yf.download("SPY", start=start, end=end, progress=False)
+        data = data.reset_index()[["Date", "Close"]].rename(columns={"Date": "date", "Close": "close"})
+        data["date"] = pd.to_datetime(data["date"])
+        return data[["date", "close"]]
+
     def _has_future_outlook(self, text: str) -> bool:
         """Return True if the transcript contains language suggesting a forward outlook.
 
@@ -217,7 +231,7 @@ class DataIngestion:
             return 0.0
         return float(recent.std())
 
-    def align_and_label(self, transcripts: pd.DataFrame, prices: pd.DataFrame, days_forward: int = 7, pct_threshold: float = 0.02) -> pd.DataFrame:
+    def align_and_label(self, transcripts: pd.DataFrame, prices: pd.DataFrame, days_forward: int = 7, pct_threshold: float = 0.02, spy_prices: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """For each transcript, compute percent return over `days_forward` trading days and label.
 
         Labels: 1 = buy (future return >= pct_threshold), 0 = sell (<= -pct_threshold), 2 = hold otherwise.
@@ -226,10 +240,22 @@ class DataIngestion:
         assigned to ``pct_threshold`` is interpreted as *volatility multiples*
         (e.g. ``2.0`` means two standard deviations).
 
+        If ``spy_prices`` is provided, labels are computed using residual return
+        (stock return - SPY return) instead of absolute stock return. This predicts
+        whether the stock beats the market rather than just if price goes up.
+
         The function merges on company/ticker if present; otherwise it uses only dates.
         """
         t = transcripts.copy()
         p = prices.copy()
+        
+        # Prepare SPY prices if provided
+        spy_lookup = None
+        if spy_prices is not None:
+            s = spy_prices.copy()
+            s["date"] = pd.to_datetime(s["date"])
+            s = s.sort_values("date")
+            spy_lookup = s.set_index("date")["close"].sort_index()
 
         # ensure transcript dates are naive datetimes (drop any tz info)
         t["date"] = pd.to_datetime(t["date"])
@@ -277,32 +303,60 @@ class DataIngestion:
                 future_prices = p.loc[p["date"] >= future_date].sort_values("date")
 
             if future_prices.empty:
-                return pd.Series({"future_return": None, "vol_adj_return": None, "label": None})
+                return pd.Series({"future_return": None, "vol_adj_return": None, "residual_return": None, "label": None})
             future_close = future_prices.iloc[0]["close"]
             fut_ret = (future_close - start_price) / start_price
+            
+            # Compute residual return if SPY prices provided
+            residual_ret = None
+            if spy_lookup is not None:
+                try:
+                    # Get SPY price at start and future dates
+                    spy_start = None
+                    spy_future = None
+                    
+                    # Find SPY price on or before start_date
+                    spy_at_start = spy_lookup[spy_lookup.index <= start_date]
+                    if not spy_at_start.empty:
+                        spy_start = spy_at_start.iloc[-1]
+                    
+                    # Find SPY price on or after future_date
+                    spy_at_future = spy_lookup[spy_lookup.index >= future_date]
+                    if not spy_at_future.empty:
+                        spy_future = spy_at_future.iloc[0]
+                    
+                    if spy_start is not None and spy_future is not None:
+                        spy_ret = (spy_future - spy_start) / spy_start
+                        residual_ret = fut_ret - spy_ret
+                except Exception:
+                    pass
+            
             # compute volatility on start_date (e.g. 30-day window)
             vol = self.compute_volatility(p, start_date)
             vol_adj = None
             if vol and vol > 0:
                 vol_adj = fut_ret / vol
 
-            # classify based on volatility‑adjusted return
+            # Use residual return for labeling if available, otherwise use absolute return
+            return_to_classify = residual_ret if residual_ret is not None else fut_ret
+            
+            # classify based on volatility‑adjusted return or residual return
             if vol_adj is not None:
-                if vol_adj >= pct_threshold:
+                if return_to_classify >= pct_threshold:
                     lbl = 1
-                elif vol_adj <= -pct_threshold:
+                elif return_to_classify <= -pct_threshold:
                     lbl = 0
                 else:
                     lbl = 2
             else:
                 # fallback to raw threshold if volatility missing
-                if fut_ret >= pct_threshold:
+                if return_to_classify >= pct_threshold:
                     lbl = 1
-                elif fut_ret <= -pct_threshold:
+                elif return_to_classify <= -pct_threshold:
                     lbl = 0
                 else:
                     lbl = 2
-            return pd.Series({"future_return": fut_ret, "vol_adj_return": vol_adj, "label": lbl})
+            return pd.Series({"future_return": fut_ret, "residual_return": residual_ret, "vol_adj_return": vol_adj, "label": lbl})
 
         labels = t.apply(label_row, axis=1)
         out = pd.concat([t.reset_index(drop=True), labels.reset_index(drop=True)], axis=1)

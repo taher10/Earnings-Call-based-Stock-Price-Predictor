@@ -96,6 +96,17 @@ def train(args):
     # column renaming, etc.
     transcripts.to_csv(out_dir / "input_transcripts.csv", index=False)
     prices.to_csv(out_dir / "input_prices.csv", index=False)
+    
+    # Fetch SPY prices for residual return computation
+    spy_prices = None
+    try:
+        start = transcripts["date"].min().strftime("%Y-%m-%d")
+        end = transcripts["date"].max().strftime("%Y-%m-%d")
+        spy_prices = di.fetch_spy_prices(start=start, end=end)
+        print(f"Auto-fetched SPY prices ({len(spy_prices)} rows) for residual return computation")
+    except Exception as e:
+        print(f"Warning: Could not fetch SPY prices for residual returns: {e}")
+        print("Will use absolute returns instead")
 
     # compute window returns around each transcript (step 2)
     df = di.align_with_window(

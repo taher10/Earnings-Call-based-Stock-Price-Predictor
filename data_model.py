@@ -3,6 +3,7 @@ import pandas as pd
 import joblib
 from sklearn.pipeline import Pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report
 import numpy as np
@@ -10,18 +11,50 @@ import numpy as np
 
 # Financial earnings-speak stop words to filter out
 FINANCIAL_STOP_WORDS = [
+    # Forward-looking statements
     "forward", "looking", "forward-looking", "statements", "statement",
+    # Time references
     "quarter", "quarterly", "year", "annual", "annually",
+    # Financial metrics (too common)
     "earnings", "revenue", "gross", "margin", "margins",
-    "guidance", "outlook", "guidance", "fy", "q1", "q2", "q3", "q4",
-    "conference", "call", "participants", "operator",
+    "fy", "q1", "q2", "q3", "q4",
+    # Conference/presentation artifacts
+    "conference", "call", "participants", "operator", "question",
+    # Filler words and non-substantive speech
+    "uh", "um", "ah", "er", "basically", "really", "just", "like", "kind", "sort", "obviously",
+    # Common operators/question phrasing
+    "question is from", "next question", "operator", "thanks", "thank",
+    # Generic verbs/pronouns
     "see", "saw", "seen", "say", "said", "says",
     "believe", "believes", "believed",
     "expect", "expects", "expected", "expectation",
     "business", "company", "we", "us", "our", "they", "their", "them",
     "would", "could", "should", "may", "might",
-    "will", "will", "going", "etc"
+    "will", "is", "are", "be", "going", "etc", "guidance", "outlook",
+    # Generic prepositions/articles
+    "the", "a", "an", "and", "or", "of", "in", "to", "at", "by", "from", "as", "with",
 ]
+
+# Financial lexicon: high-value terms that should get boosted weight
+FINANCIAL_LEXICON = {
+    # Profitability and growth indicators
+    "margin": 1.5, "margins": 1.5, "revenue": 1.3, "growth": 1.4, "profitability": 1.6,
+    "earnings": 1.2, "profit": 1.5, "ebitda": 1.4, "cash flow": 1.5, "fcf": 1.6,
+    "guidance": 1.7, "outlook": 1.6, "forecast": 1.5,
+    # Risk/Positive indicators
+    "risk": 1.2, "opportunity": 1.3, "strength": 1.4, "momentum": 1.5, "accelerate": 1.4,
+    "expand": 1.3, "improve": 1.3, "optimize": 1.2, "efficiency": 1.3,
+    # Demand and market share
+    "demand": 1.3, "market share": 1.5, "customer": 1.2, "adoption": 1.4, "penetration": 1.4,
+    # Negative indicators
+    "challenge": 0.8, "headwind": 0.7, "decline": 0.6, "weakness": 0.6, "pressure": 0.7,
+    "competition": 0.8, "competitor": 0.8, "obsolescence": 0.5, "inventory": 0.7,
+    # Macro/currency effects
+    "currency": 0.9, "macro": 0.9, "macroeconomic": 0.9, "inflation": 0.8,
+    # Product/segment terms
+    "inventory": 0.7, "supply": 0.9, "supply chain": 0.8, "storage": 1.2,
+}
+
 
 
 class TextModel:
@@ -80,6 +113,10 @@ class TextModel:
         # heuristic boosts based on simple text indicators
         self.numeric_weight = 0.005   # per numeric mention
         self.outlook_boost = 0.25     # fixed boost if forward-looking language present
+        
+        # Meta-model and scaling
+        self.meta_model = None  # Will be initialized during fit if training succeeds
+        self.meta_scaler = None  # Will be initialized during fit if meta_model is trained
 
     def temporal_split(self, df: pd.DataFrame, train_until: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Split data by a cutoff date (inclusive train, exclusive test).
@@ -113,6 +150,29 @@ class TextModel:
         train = df2[df2["date"] <= cutoff].copy()
         test = df2[df2["date"] > cutoff].copy()
         return train, test
+
+    def _scores_to_sentiment(self, arr):
+        """Convert raw classifier decision_function scores to normalized sentiment.
+        
+        Args:
+            arr: Can be scalar, zero-dim array, or array-like from decision_function
+            
+        Returns:
+            float: Normalized sentiment score (usually in range [-1, 1] or similar)
+        """
+        a = np.asarray(arr)
+        if a.ndim == 0:
+            # zero-dim array -> extract scalar
+            return float(a)
+        # now we have at least 1D
+        a = a.ravel()
+        if a.size >= 2:
+            # binary case: return prob(positive_class) - prob(negative_class)
+            return float(a[1] - a[0])
+        elif a.size == 1:
+            return float(a[0])
+        else:
+            return 0.0
 
     def fit(self, train_df: pd.DataFrame, text_col: str = "transcript", label_col: str = "label", return_col: str = "future_return"):
         # similar to ``evaluate``, guard against a DataFrame being returned
@@ -187,6 +247,7 @@ class TextModel:
         # now build meta‑model features and fit a regression to the actual returns
         try:
             from sklearn.linear_model import Ridge
+            import numpy as _np
 
             if return_col not in train_df.columns:
                 return_col = "future_return"
@@ -209,15 +270,20 @@ class TextModel:
                         float(feats.get("outlook_flag", 0)),
                     ])
                     y_meta.append(row[return_col])
-                import numpy as _np
                 X_meta = _np.array(X_meta)
                 y_meta = _np.array(y_meta)
+                
+                # Scale features to prevent one feature from drowning out others
+                self.meta_scaler = StandardScaler()
+                X_meta_scaled = self.meta_scaler.fit_transform(X_meta)
+                
                 self.meta_model = Ridge(alpha=1.0)
-                self.meta_model.fit(X_meta, y_meta)
-                print("Meta-model trained on", len(y_meta), "examples")
+                self.meta_model.fit(X_meta_scaled, y_meta)
+                print("Meta-model trained on", len(y_meta), "examples (with z-score scaling)")
         except Exception as e:
             print(f"Warning: could not train meta-model: {e}")
             self.meta_model = None
+            self.meta_scaler = None
 
     def _extract_feature_importance(self):
         """Extract learned feature weights from the trained LogisticRegression model."""
@@ -237,6 +303,16 @@ class TextModel:
                 name: float(imp) 
                 for name, imp in zip(self.feature_names, importance)
             }
+            
+            # Boost importance of financial lexicon terms
+            for feature_name in self.feature_importance:
+                feature_lower = feature_name.lower()
+                # Check if feature matches any financial lexicon term
+                for lexicon_term, weight in FINANCIAL_LEXICON.items():
+                    if lexicon_term in feature_lower:
+                        # Apply financial weight multiplier (boost or dampen)
+                        self.feature_importance[feature_name] *= weight
+                        break  # Only apply first matching term per feature
         except Exception as e:
             print(f"Could not extract feature importance: {e}")
             self.feature_importance = None
@@ -706,36 +782,20 @@ class TextModel:
             
             # Get coefficients for the logistic regression model
             clf = self.pipeline.named_steps["clf"]
-            
-            # compute a classifier-based score for the *entire* transcript
-            def _scores_to_sentiment(arr):
-                # arr may be scalar, zero‑dim array, or array-like
-                a = np.asarray(arr)
-                if a.ndim == 0:
-                    # zero-dim -> just return value
-                    return float(a)
-                # now we have at least 1D
-                a = a.ravel()
-                if a.size >= 2:
-                    return float(a[1] - a[0])
-                elif a.size == 1:
-                    return float(a[0])
-                else:
-                    return 0.0
 
             full_vec = tfidf_vec.transform([text])
             raw_full = clf.decision_function(full_vec)
-            full_sentiment = _scores_to_sentiment(raw_full)
+            full_sentiment = self._scores_to_sentiment(raw_full)
 
             # Management section score
             raw_mgmt = clf.decision_function(mgmt_vec)
-            mgmt_sentiment = _scores_to_sentiment(raw_mgmt)
+            mgmt_sentiment = self._scores_to_sentiment(raw_mgmt)
             
             # Q&A section score (double the weight for negative sentiment, aka "stress")
             qa_sentiment = 0.0
             if qa_vec is not None and qa_text.strip():
                 raw_qa = clf.decision_function(qa_vec)
-                qa_sentiment = _scores_to_sentiment(raw_qa)
+                qa_sentiment = self._scores_to_sentiment(raw_qa)
                 
                 # If negative sentiment detected in Q&A, double the penalty (stress metric)
                 if qa_sentiment < 0:
@@ -785,7 +845,12 @@ class TextModel:
                         float(num_count),
                         float(outlook_flag),
                     ]])
-                    meta_pred = self.meta_model.predict(feat_vec)[0]
+                    # Apply the same scaling that was used during training
+                    if self.meta_scaler is not None:
+                        feat_vec_scaled = self.meta_scaler.transform(feat_vec)
+                    else:
+                        feat_vec_scaled = feat_vec
+                    meta_pred = self.meta_model.predict(feat_vec_scaled)[0]
                     # meta_pred represents a return prediction; apply same decay/obfuscation
                     obfuscated_sentiment = float(meta_pred) * obfuscation_penalty
                 except Exception as e:
@@ -858,7 +923,27 @@ class TextModel:
                 return diagnostics, 0.0, 2  # Default to HOLD
 
     def save(self, path: str):
+        """Save pipeline, meta-model, and scaler to disk."""
+        # Save main pipeline
         joblib.dump(self.pipeline, path)
+        # Save meta-model and scaler if they exist
+        if self.meta_model is not None:
+            base_path = path.replace('.pkl', '')
+            joblib.dump(self.meta_model, f"{base_path}_meta_model.pkl")
+        if self.meta_scaler is not None:
+            base_path = path.replace('.pkl', '')
+            joblib.dump(self.meta_scaler, f"{base_path}_meta_scaler.pkl")
 
     def load(self, path: str):
+        """Load pipeline, meta-model, and scaler from disk."""
         self.pipeline = joblib.load(path)
+        # Load meta-model and scaler if they exist
+        base_path = path.replace('.pkl', '')
+        try:
+            self.meta_model = joblib.load(f"{base_path}_meta_model.pkl")
+        except Exception:
+            self.meta_model = None
+        try:
+            self.meta_scaler = joblib.load(f"{base_path}_meta_scaler.pkl")
+        except Exception:
+            self.meta_scaler = None
