@@ -47,6 +47,12 @@ PRODUCT_NAMES = {
 }
 
 
+
+# keep a module‑level flag so we only download once per session; the NLTK
+# check is relatively expensive and was causing repeated log spam during
+# batch scoring.
+_nltk_ready = False
+
 class DataCleaning:
     """Simple cleaning utilities for earnings transcripts.
 
@@ -57,14 +63,17 @@ class DataCleaning:
     """
 
     def __init__(self):
-        try:
-            nltk.data.find("tokenizers/punkt")
-        except Exception:
-            nltk.download("punkt")
-        try:
-            nltk.data.find("corpora/wordnet")
-        except Exception:
-            nltk.download("wordnet")
+        global _nltk_ready
+        if not _nltk_ready:
+            try:
+                nltk.data.find("tokenizers/punkt")
+            except Exception:
+                nltk.download("punkt")
+            try:
+                nltk.data.find("corpora/wordnet")
+            except Exception:
+                nltk.download("wordnet")
+            _nltk_ready = True
         self.lemmatizer = WordNetLemmatizer()
 
     def mask_entities(self, text: str) -> str:

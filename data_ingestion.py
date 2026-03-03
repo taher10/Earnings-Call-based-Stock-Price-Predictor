@@ -117,18 +117,25 @@ class DataIngestion:
         ticker: str,
         years: Optional[List[int]] = None,
         quarters: Optional[List[int]] = None,
+        timeout: Optional[float] = None,
     ) -> pd.DataFrame:
         """Fetch transcripts via the *earningscall* Python library.
 
         This library provides a convenient API to pull earnings call text for
-        a given ticker.  You can optionally filter by years and/or quarters.  The
-        returned ``DataFrame`` has the same columns as ``load_transcripts_csv``
-        and can be fed directly to :meth:`align_and_label`.
+        a given ticker.  You can optionally filter by years and/or quarters and
+        also specify a per‑transcript fetch timeout to avoid hanging on a slow
+        network or an unresponsive backend.  The returned ``DataFrame`` has the
+        same columns as ``load_transcripts_csv`` and can be fed directly to
+        :meth:`align_and_label`.
+
+        ``timeout`` is interpreted as seconds passed through ``concurrent.futures``
+        and applies to each individual ``company.get_transcript`` call.  When a
+        timeout occurs the event is skipped and processing continues.
 
         Example::
 
             di = DataIngestion()
-            df = di.fetch_transcripts_earningscall("AAPL", years=[2024])
+            df = di.fetch_transcripts_earningscall("AAPL", years=[2024], timeout=30)
 
         Requires ``earningscall`` to be installed; raises ``ImportError`` if not.
         """
@@ -151,7 +158,22 @@ class DataIngestion:
                 continue
             if quarters and ev.quarter not in quarters:
                 continue
-            tr = company.get_transcript(event=ev)
+            # fetch the text, enforcing the user-specified timeout if provided
+            try:
+                if timeout is not None:
+                    import concurrent.futures
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        # call using keyword to match original signature
+                        future = executor.submit(company.get_transcript, event=ev)
+                        tr = future.result(timeout=timeout)
+                else:
+                    tr = company.get_transcript(event=ev)
+            except Exception as exc:  # include TimeoutError and network errors
+                # so that a single bad request doesn't abort the whole loop
+                print(f"warning: could not fetch transcript for event {ev}: {exc}")
+                continue
+
             if tr is None or not hasattr(tr, "text"):
                 continue
             date = ev.conference_date if ev.conference_date is not None else pd.to_datetime(
@@ -173,10 +195,37 @@ class DataIngestion:
                 df = df.rename(columns={"company": "ticker"})
         return df
 
+    def compute_volatility(self, prices: pd.DataFrame, as_of: pd.Timestamp, window: int = 30) -> Optional[float]:
+        """Return historical volatility (std of daily pct change) up to `as_of`.
+
+        ``window`` is the number of most recent trading days to include; if fewer
+        days are available we use whatever exists.  The caller may pass an entire
+        prices DataFrame once and call this repeatedly; internally it filters by
+        date each time.
+        """
+        if prices.empty:
+            return None
+        df = prices.copy()
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date")
+        df = df[df["date"] <= as_of]
+        if df.empty:
+            return None
+        df["ret"] = df["close"].pct_change()
+        recent = df["ret"].dropna().tail(window)
+        if recent.empty:
+            return 0.0
+        return float(recent.std())
+
     def align_and_label(self, transcripts: pd.DataFrame, prices: pd.DataFrame, days_forward: int = 7, pct_threshold: float = 0.02) -> pd.DataFrame:
         """For each transcript, compute percent return over `days_forward` trading days and label.
 
         Labels: 1 = buy (future return >= pct_threshold), 0 = sell (<= -pct_threshold), 2 = hold otherwise.
+        Rather than use an absolute percentage threshold we normalise the return by
+        the stock's historical volatility at the time of the call.  The value
+        assigned to ``pct_threshold`` is interpreted as *volatility multiples*
+        (e.g. ``2.0`` means two standard deviations).
+
         The function merges on company/ticker if present; otherwise it uses only dates.
         """
         t = transcripts.copy()
@@ -228,16 +277,32 @@ class DataIngestion:
                 future_prices = p.loc[p["date"] >= future_date].sort_values("date")
 
             if future_prices.empty:
-                return pd.Series({"future_return": None, "label": None})
+                return pd.Series({"future_return": None, "vol_adj_return": None, "label": None})
             future_close = future_prices.iloc[0]["close"]
             fut_ret = (future_close - start_price) / start_price
-            if fut_ret >= pct_threshold:
-                lbl = 1
-            elif fut_ret <= -pct_threshold:
-                lbl = 0
+            # compute volatility on start_date (e.g. 30-day window)
+            vol = self.compute_volatility(p, start_date)
+            vol_adj = None
+            if vol and vol > 0:
+                vol_adj = fut_ret / vol
+
+            # classify based on volatility‑adjusted return
+            if vol_adj is not None:
+                if vol_adj >= pct_threshold:
+                    lbl = 1
+                elif vol_adj <= -pct_threshold:
+                    lbl = 0
+                else:
+                    lbl = 2
             else:
-                lbl = 2
-            return pd.Series({"future_return": fut_ret, "label": lbl})
+                # fallback to raw threshold if volatility missing
+                if fut_ret >= pct_threshold:
+                    lbl = 1
+                elif fut_ret <= -pct_threshold:
+                    lbl = 0
+                else:
+                    lbl = 2
+            return pd.Series({"future_return": fut_ret, "vol_adj_return": vol_adj, "label": lbl})
 
         labels = t.apply(label_row, axis=1)
         out = pd.concat([t.reset_index(drop=True), labels.reset_index(drop=True)], axis=1)

@@ -36,13 +36,13 @@ class TextModel:
         stop_words = FINANCIAL_STOP_WORDS if use_financial_stopwords else "english"
         self.pipeline = Pipeline([
             ("tfidf", TfidfVectorizer(
-                max_features=20000,
-                ngram_range=(1, 2),  # unigrams and bigrams
+                max_features=30000,                    # allow more features
+                ngram_range=(1, 3),  # unigrams, bigrams, trigrams
                 stop_words=stop_words,
                 min_df=1,
-                max_df=0.95
+                max_df=0.9,                             # be a bit more aggressive filtering
             )),
-            ("clf", LogisticRegression(max_iter=1000, class_weight="balanced"))
+            ("clf", LogisticRegression(max_iter=2000, class_weight="balanced", solver="saga"))
         ])
         self.feature_importance = None  # Will store learned feature weights
         self.feature_names = None  # Will store TF-IDF feature names
@@ -73,6 +73,13 @@ class TextModel:
             "iphone 13": "2021-09-01",
             "iphone 12": "2020-10-01",
         }
+        # Weights used when combining different sentiment signals
+        self.mgmt_weight = 0.6      # default emphasis on management remarks
+        self.qa_weight = 0.4        # weight on Q&A sentiment
+        self.full_text_weight = 0.5 # combine section-based and whole-text scores equally
+        # heuristic boosts based on simple text indicators
+        self.numeric_weight = 0.005   # per numeric mention
+        self.outlook_boost = 0.25     # fixed boost if forward-looking language present
 
     def temporal_split(self, df: pd.DataFrame, train_until: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Split data by a cutoff date (inclusive train, exclusive test).
@@ -107,7 +114,7 @@ class TextModel:
         test = df2[df2["date"] > cutoff].copy()
         return train, test
 
-    def fit(self, train_df: pd.DataFrame, text_col: str = "transcript", label_col: str = "label"):
+    def fit(self, train_df: pd.DataFrame, text_col: str = "transcript", label_col: str = "label", return_col: str = "future_return"):
         # similar to ``evaluate``, guard against a DataFrame being returned
         # when pandas finds multiple columns with the same name.  this can
         # happen earlier in the pipeline if the original and cleaned versions
@@ -123,6 +130,11 @@ class TextModel:
         # Extract feature importance after fitting
         self._extract_feature_importance()
         
+        # also train a simple meta-model that learns how to weight the various
+        # sectional signals.  this converts the hard‑coded averaging logic into a
+        # learned linear combination.  we will collect the features below.
+        self.meta_model = None
+
         # COMPUTE TRAINING BASELINE: Calculate sentiment distribution on training data
         # This will be used to normalize test scores relative to training
         try:
@@ -133,24 +145,73 @@ class TextModel:
             # Get decision function scores for training data
             training_scores = []
             for idx in range(len(X)):
-                scores = clf.decision_function(X_vec[idx:idx+1])[0]
-                # Sentiment = prob(buy) - prob(sell) from decision function
-                sentiment = scores[1] - scores[0] if len(scores) >= 2 else scores[0]
+                out = clf.decision_function(X_vec[idx:idx+1])
+                # handle classifier with only one class: decision_function returns a scalar
+                if np.isscalar(out):
+                    scores = np.array([out])
+                else:
+                    scores = out[0]
+                # Sentiment = prob(buy) - prob(sell) if we have at least two classes
+                if hasattr(scores, '__len__') and len(scores) >= 2:
+                    sentiment = scores[1] - scores[0]
+                else:
+                    sentiment = float(scores)
                 training_scores.append(sentiment)
             
-            # Store mean and std of training sentiment
-            self.training_sentiment_mean = np.mean(training_scores)
-            self.training_sentiment_std = np.std(training_scores)
-            
-            # Ensure std is not zero (avoid division by zero)
-            if self.training_sentiment_std < 0.01:
-                self.training_sentiment_std = 0.1
-            
-            print(f"Training baseline: mean={self.training_sentiment_mean:.4f}, std={self.training_sentiment_std:.4f}")
+            if training_scores:
+                # Store mean and std of training sentiment
+                self.training_sentiment_mean = np.mean(training_scores)
+                self.training_sentiment_std = np.std(training_scores)
+                
+                # Ensure std is not zero (avoid division by zero)
+                if self.training_sentiment_std < 0.01:
+                    self.training_sentiment_std = 0.1
+                
+                print(f"Training baseline: mean={self.training_sentiment_mean:.4f}, std={self.training_sentiment_std:.4f}")
+            else:
+                # no scores collected; use defaults
+                self.training_sentiment_mean = 0.0
+                self.training_sentiment_std = 1.0
         except Exception as e:
             print(f"Warning: Could not compute training baseline: {e}")
             self.training_sentiment_mean = 0.0
             self.training_sentiment_std = 1.0
+
+        # ------------------------------------------------------------------
+        # now build meta‑model features and fit a regression to the actual returns
+        try:
+            from sklearn.linear_model import Ridge
+
+            if return_col not in train_df.columns:
+                return_col = "future_return"
+            meta_rows = train_df.dropna(subset=[return_col, text_col, "date"]).copy()
+            if not meta_rows.empty:
+                X_meta = []
+                y_meta = []
+                for idx, row in meta_rows.iterrows():
+                    feats = self._compute_raw_features(
+                        row[text_col],
+                        transcript_date=pd.Timestamp(row["date"]),
+                        ticker=row.get("ticker", "")
+                    )
+                    X_meta.append([
+                        feats["full_sentiment"],
+                        feats["mgmt_sentiment"],
+                        feats["qa_sentiment"],
+                        feats["obfuscation_penalty"],
+                        feats["numeric_count"],
+                        float(feats.get("outlook_flag", 0)),
+                    ])
+                    y_meta.append(row[return_col])
+                import numpy as _np
+                X_meta = _np.array(X_meta)
+                y_meta = _np.array(y_meta)
+                self.meta_model = Ridge(alpha=1.0)
+                self.meta_model.fit(X_meta, y_meta)
+                print("Meta-model trained on", len(y_meta), "examples")
+        except Exception as e:
+            print(f"Warning: could not train meta-model: {e}")
+            self.meta_model = None
 
     def _extract_feature_importance(self):
         """Extract learned feature weights from the trained LogisticRegression model."""
@@ -205,6 +266,55 @@ class TextModel:
         decay_multiplier = np.exp(-decay_rate * max(0, months_ago))
         
         return decay_multiplier
+
+    def _compute_raw_features(self, text: str, transcript_date: pd.Timestamp, ticker: str = "AAPL") -> dict:
+        """Return the raw signals used by the meta‑model.
+
+        The dictionary includes full-transcript sentiment, section sentiments,
+        obfuscation penalty, numeric counts and outlook flag.  These are
+        computed using the underlying TF-IDF/classifier and cleaning helpers.
+        """
+        # reuse scoring logic but stop before meta-model / decay / velocity
+        from data_cleaning import DataCleaning
+        dc = DataCleaning()
+
+        # management / QA split and obfuscation
+        mgmt_text, qa_text = dc.extract_qa_section(text)
+        qa_hedging_density = dc.measure_hedging_density(qa_text) if qa_text else 0.0
+        obfuscation_penalty = 1.0 - (qa_hedging_density * 0.5)
+
+        tfidf_vec = self.pipeline.named_steps["tfidf"]
+        clf = self.pipeline.named_steps["clf"]
+
+        def _score(txt):
+            vec = tfidf_vec.transform([txt])
+            raw = clf.decision_function(vec)
+            # reuse conversion helper
+            return self._scores_to_sentiment(raw)
+
+        full_sentiment = _score(text)
+        mgmt_sentiment = _score(mgmt_text)
+        qa_sentiment = _score(qa_text) if qa_text else 0.0
+        if qa_sentiment < 0:
+            qa_sentiment *= 2.0
+
+        numeric_count = None
+        outlook_flag = 0
+        try:
+            di = DataIngestion()
+            numeric_count = di._count_numbers(text)
+            outlook_flag = 1 if di._has_future_outlook(text) else 0
+        except Exception:
+            numeric_count = 0
+        result = {
+            "full_sentiment": float(full_sentiment),
+            "mgmt_sentiment": float(mgmt_sentiment),
+            "qa_sentiment": float(qa_sentiment),
+            "obfuscation_penalty": float(obfuscation_penalty),
+            "numeric_count": float(numeric_count),
+            "outlook_flag": float(outlook_flag),
+        }
+        return result
 
     def tune_thresholds_percentile(self, scores: List[float], percentile_buy: int = 85, percentile_sell: int = 15):
         """Tune classification thresholds based on percentiles of sentiment scores.
@@ -469,6 +579,63 @@ class TextModel:
         preds = self.pipeline.predict(X)
         return classification_report(y, preds, zero_division=0)
 
+    # ------------------------------------------------------------------
+    def information_coefficient(self, returns: List[float], scores: List[float]) -> float:
+        """Compute Spearman rank correlation between two sequences.
+
+        The information coefficient (IC) is simply the rank correlation
+        between the signal (scores) and the future returns.  Values closer to
+        1 or -1 indicate a strong monotonic relationship; 0 indicates no
+        predictive power.  A hedge fund will often look for an IC of 0.05+
+        consistently across time.
+        """
+        try:
+            from scipy.stats import spearmanr
+            ic = spearmanr(returns, scores).correlation
+            return float(ic)
+        except Exception:
+            return 0.0
+
+    def bootstrap_ic(self, df: pd.DataFrame, n_splits: int = 100, test_size: float = 0.2, text_col: str = "transcript", return_col: str = "future_return") -> Tuple[float, float]:
+        """Estimate IC mean/std via repeated shuffle splits (bootstrap-like).
+
+        Returns a tuple ``(mean_ic, std_ic)`` computed over ``n_splits``
+        randomly selected train/test splits of the provided DataFrame.  This
+        provides an idea of how stable the signal is and guards against
+        overfitting on a small sample.
+        """
+        from sklearn.model_selection import ShuffleSplit
+        import numpy as _np
+
+        ics = []
+        splitter = ShuffleSplit(n_splits=n_splits, test_size=test_size, random_state=42)
+        for train_idx, test_idx in splitter.split(df):
+            train = df.iloc[train_idx]
+            test = df.iloc[test_idx]
+            # fit on train only
+            try:
+                self.fit(train, text_col=text_col, label_col="label", return_col=return_col)
+            except Exception:
+                continue
+            scores = []
+            returns = []
+            for _, row in test.iterrows():
+                if pd.isna(row.get(return_col)):
+                    continue
+                _, score, _ = self.score_and_label(
+                    row[text_col],
+                    transcript_date=pd.to_datetime(row.get("date")),
+                    ticker=row.get("ticker", "")
+                )
+                scores.append(score)
+                returns.append(row.get(return_col))
+            if len(scores) > 1:
+                ic = self.information_coefficient(returns, scores)
+                ics.append(ic)
+        if not ics:
+            return 0.0, 0.0
+        return float(_np.mean(ics)), float(_np.std(ics))
+
     def predict(self, text: str) -> int:
         pred = self.pipeline.predict([text])[0]
         return int(pred)
@@ -534,29 +701,91 @@ class TextModel:
             # Get coefficients for the logistic regression model
             clf = self.pipeline.named_steps["clf"]
             
+            # compute a classifier-based score for the *entire* transcript
+            def _scores_to_sentiment(arr):
+                # arr may be scalar, zero‑dim array, or array-like
+                a = np.asarray(arr)
+                if a.ndim == 0:
+                    # zero-dim -> just return value
+                    return float(a)
+                # now we have at least 1D
+                a = a.ravel()
+                if a.size >= 2:
+                    return float(a[1] - a[0])
+                elif a.size == 1:
+                    return float(a[0])
+                else:
+                    return 0.0
+
+            full_vec = tfidf_vec.transform([text])
+            raw_full = clf.decision_function(full_vec)
+            full_sentiment = _scores_to_sentiment(raw_full)
+
             # Management section score
-            mgmt_scores = clf.decision_function(mgmt_vec)[0]
-            mgmt_sentiment = mgmt_scores[1] - mgmt_scores[0] if len(mgmt_scores) >= 2 else mgmt_scores[0]
+            raw_mgmt = clf.decision_function(mgmt_vec)
+            mgmt_sentiment = _scores_to_sentiment(raw_mgmt)
             
             # Q&A section score (double the weight for negative sentiment, aka "stress")
             qa_sentiment = 0.0
             if qa_vec is not None and qa_text.strip():
-                qa_scores = clf.decision_function(qa_vec)[0]
-                qa_sentiment = qa_scores[1] - qa_scores[0] if len(qa_scores) >= 2 else qa_scores[0]
+                raw_qa = clf.decision_function(qa_vec)
+                qa_sentiment = _scores_to_sentiment(raw_qa)
                 
                 # If negative sentiment detected in Q&A, double the penalty (stress metric)
                 if qa_sentiment < 0:
                     qa_sentiment *= 2.0
             
-            # Combine scores with Q&A stress weighting
-            combined_sentiment = 0.7 * mgmt_sentiment + 0.3 * qa_sentiment
-            
+            # Combine section scores using configurable weights
+            section_sentiment = (
+                self.mgmt_weight * mgmt_sentiment
+                + self.qa_weight * qa_sentiment
+            )
+
+            # average with the full-text score so that the model's learned
+            # weights are always factored in
+            combined_sentiment = (
+                section_sentiment * self.full_text_weight
+                + full_sentiment * (1 - self.full_text_weight)
+            )
+
+            # add heuristic boosts from numeric mentions / outlook language
+            num_count = 0
+            outlook_flag = 0
+            try:
+                # reuse ingestion heuristics
+                from data_ingestion import DataIngestion
+                helper = DataIngestion()
+                num_count = helper._count_numbers(text)
+                outlook_flag = 1 if helper._has_future_outlook(text) else 0
+            except Exception:
+                pass
+            combined_sentiment += self.numeric_weight * num_count + self.outlook_boost * outlook_flag
+
             # Apply temporal decay to all features (modulate the final score)
             # Features from older products get less influence
             decay_multiplier = self._apply_temporal_decay("general", transcript_date)
             
             # Apply obfuscation penalty (high hedging = bearish)
             obfuscated_sentiment = combined_sentiment * obfuscation_penalty
+
+            # if a meta-model has been trained, use it to compute the base score
+            if self.meta_model is not None:
+                try:
+                    feat_vec = np.array([[
+                        full_sentiment,
+                        mgmt_sentiment,
+                        qa_sentiment,
+                        obfuscation_penalty,
+                        float(num_count),
+                        float(outlook_flag),
+                    ]])
+                    meta_pred = self.meta_model.predict(feat_vec)[0]
+                    # meta_pred represents a return prediction; apply same decay/obfuscation
+                    obfuscated_sentiment = float(meta_pred) * obfuscation_penalty
+                except Exception as e:
+                    print(f"meta-model prediction failed: {e}")
+                    # leave obfuscated_sentiment as previously computed
+                    pass
             
             # Calculate Z-score relative to TRAINING sentiment distribution
             # This tells us: how extreme is this score compared to training?
@@ -588,8 +817,18 @@ class TextModel:
                 label = 0  # SELL
             else:
                 label = 2  # HOLD
-                
-            return diagnostics, float(final_sentiment), int(label)
+
+            # ensure final_sentiment is a plain Python float (avoid 0-d arrays)
+            try:
+                final_sentiment = float(final_sentiment)
+            except Exception:
+                try:
+                    # try converting via numpy
+                    final_sentiment = float(np.asarray(final_sentiment).item())
+                except Exception:
+                    final_sentiment = 0.0
+
+            return diagnostics, final_sentiment, int(label)
             
         except Exception as e:
             print(f"Error in score_and_label: {e}")

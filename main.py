@@ -21,45 +21,51 @@ def train(args):
     # load or fetch transcripts
     transcripts = None
 
-    # once we have transcripts, write the raw/normalized copy (step 1)
-    if transcripts is not None:
-        # we'll write later after load, so leave placeholder
-        pass
     if args.fetch_ticker:
+        # user explicitly asked for live data
         years = None
         if args.start_year is not None and args.end_year is not None:
             years = list(range(args.start_year, args.end_year + 1))
-        transcripts = di.fetch_transcripts_earningscall(args.fetch_ticker, years=years)
-        print(f"Fetched {len(transcripts)} transcripts for {args.fetch_ticker} (years={years})")
+        transcripts = di.fetch_transcripts_earningscall(
+            args.fetch_ticker,
+            years=years,
+            timeout=args.fetch_timeout,
+        )
+        if transcripts is None or (hasattr(transcripts, "empty") and transcripts.empty):
+            print(f"Fetched transcripts for {args.fetch_ticker} (years={years}) but got none")
+        else:
+            print(f"Fetched {len(transcripts)} transcripts for {args.fetch_ticker} (years={years})")
     else:
-        # if the user is using the bundled sample dataset and the earningscall
-        # library is installed, attempt to download a richer set of transcripts
-        # (last five years for AAPL).  this makes the script behave more
-        # usefully out of the box while still allowing explicit CSV paths.
+        # maybe use the sample CSV or auto‑fetch when the default is requested
         default_sample = "data/sample_aapl_transcripts.csv"
         if args.transcripts == default_sample:
             try:
-                        # compute most recent five *completed* calendar years.  using the
-                # current year would often include future dates (as illustrated by
-                # the odd 2026 row earlier) which can't be aligned with prices and
-                # confusing to users.  restricting to ``current - 5`` through
-                # ``current-1`` keeps us safely in the past regardless of when the
-                # script is run.
+                # compute most recent five calendar years that have completed
                 import datetime
                 current = datetime.datetime.now().year
                 years = list(range(current - 5, current))
-                transcripts = di.fetch_transcripts_earningscall("AAPL", years=years)
-                print(f"Auto-fetched {len(transcripts)} transcripts for AAPL (years={years})")
+                transcripts = di.fetch_transcripts_earningscall(
+                    "AAPL",
+                    years=years,
+                    timeout=args.fetch_timeout,
+                )
+                if transcripts is None or (hasattr(transcripts, "empty") and transcripts.empty):
+                    print(f"Auto-fetched transcripts for AAPL (years={years}) but got none")
+                else:
+                    print(f"Auto-fetched {len(transcripts)} transcripts for AAPL (years={years})")
             except ImportError:
-                # earningscall not available; fall back to sample file
                 transcripts = di.load_transcripts_csv(args.transcripts)
         else:
             transcripts = di.load_transcripts_csv(args.transcripts)
 
+    # at this point we may have a DataFrame or None; fail early if it is empty
+    if transcripts is None or (hasattr(transcripts, "empty") and transcripts.empty):
+        print("no transcripts available, aborting training")
+        return
+
     # step 1: save normalized transcripts for inspection
-    if transcripts is not None:
-        transcripts.to_csv(out_dir / "step1_transcripts.csv", index=False)
-        print("Wrote step1_transcripts.csv")
+    transcripts.to_csv(out_dir / "step1_transcripts.csv", index=False)
+    print("Wrote step1_transcripts.csv")
 
 # if we auto-fetched transcripts and the user left the prices argument as
     # the sample file, it makes sense to also pull prices for the same ticker
@@ -98,19 +104,42 @@ def train(args):
         days_before=args.days_before,
         days_after=args.days_after,
     )
-    # translate window_return into the familiar future_return/label fields
+    # translate window_return into the familiar future_return field
     df["future_return"] = df.get("window_return")
-    def _make_label(r):
+
+    # compute historical volatility for each transcript and normalize
+    vols = []
+    for idx, row in df.iterrows():
         try:
-            if r >= args.pct_threshold:
+            vol = di.compute_volatility(prices, pd.to_datetime(row["date"]))
+        except Exception:
+            vol = None
+        vols.append(vol)
+    df["volatility"] = vols
+    # avoid zero/None when dividing
+    df["vol_adj_return"] = df.apply(
+        lambda r: (r["future_return"] / r["volatility"]) \
+            if pd.notna(r.get("future_return")) and r.get("volatility") and r.get("volatility") > 0 \
+            else None,
+        axis=1,
+    )
+
+    # label on volatility-adjusted return instead of raw return; threshold
+    # argument is now interpreted as multiples of volatility
+    def _make_label(v):
+        try:
+            if v is None:
+                return None
+            if v >= args.pct_threshold:
                 return 1
-            elif r <= -args.pct_threshold:
+            elif v <= -args.pct_threshold:
                 return 0
             else:
                 return 2
         except Exception:
             return None
-    df["label"] = df["future_return"].apply(_make_label)
+
+    df["label"] = df["vol_adj_return"].apply(_make_label)
 
     df.to_csv(out_dir / "step2_window.csv", index=False)
     print("Wrote step2_window.csv")
@@ -339,10 +368,25 @@ def train(args):
         else:
             report = tm.evaluate(test_df)
             print("Evaluation:\n", report)
+            # compute information coefficient on volatility-adjusted returns
+            if "vol_adj_return" in test_df.columns:
+                ic = tm.information_coefficient(
+                    test_df["vol_adj_return"].fillna(0).tolist(),
+                    test_df["learned_score"].tolist(),
+                )
+                print(f"Information Coefficient (test): {ic:.4f}")
+                # bootstrap estimate of IC stability
+                mean_ic, std_ic = tm.bootstrap_ic(test_df,
+                                                   text_col="transcript",
+                                                   return_col="vol_adj_return")
+                print(f"Bootstrap IC mean={mean_ic:.4f}, std={std_ic:.4f}")
             # save textual report for later inspection
             eval_path = out_dir / "evaluation.txt"
             with open(eval_path, "w") as fh:
                 fh.write(report)
+                if "vol_adj_return" in test_df.columns:
+                    fh.write(f"\nInformation Coefficient: {ic:.4f}\n")
+                    fh.write(f"Bootstrap IC mean={mean_ic:.4f}, std={std_ic:.4f}\n")
             print("Wrote evaluation to", eval_path)
 
         # save predictions/probabilities to CSV when a test set exists
@@ -392,6 +436,17 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        "--fetch-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Optional per-request timeout (seconds) when downloading transcripts via "
+            "--fetch-ticker or when auto-fetching the sample.  A single slow or hung "
+            "request will be skipped after this many seconds.  Setting to 0 or "
+            "omitting disables the timeout."
+        ),
+    )
+    parser.add_argument(
         "--fetch-ticker",
         help=(
             "If provided, download transcripts from the earningscall library for this ticker. "
@@ -420,7 +475,12 @@ if __name__ == '__main__':
     # running ``python main.py`` with no arguments actually gives a test set
     parser.add_argument("--train-until", dest="train_until", default="2020-06-01")
     parser.add_argument("--days-forward", type=int, default=7)
-    parser.add_argument("--pct-threshold", type=float, default=0.02)
+    parser.add_argument("--pct-threshold", type=float, default=2.0,
+                        help=(
+                            "threshold in units of volatility multiples used for labeling. "
+                            "e.g. 2.0 means returns \u22652 sigma are labeled BUY, <=-2 sigma SELL. "
+                            "(default 2.0, roughly equivalent to 2% when vol ~1%)"
+                        ))
     parser.add_argument(
         "--days-before",
         type=int,

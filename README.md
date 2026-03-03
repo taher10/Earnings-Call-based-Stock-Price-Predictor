@@ -37,6 +37,28 @@ for building a more “robust” training set:
 * `--min-numeric N` removes transcripts with fewer than **N** numeric mentions
   (percentages, dollar figures, etc.).
 
+### Volatility‑normalized returns
+
+Rather than using a fixed 2% cutoff, the pipeline now divides each window
+return by the stock's historical volatility (default 30‑day,std of daily
+returns).  Thresholds such as `--pct-threshold` are treated as **multiples of
+volatility** (e.g. `2.0` means two standard deviations).  This makes signals
+comparable across calm and turbulent market regimes; you'll see new columns
+`volatility` and `vol_adj_return` in the step‑2 output.
+
+### Signal evaluation improvements
+
+We no longer rely solely on accuracy.  After training the model reports the
+Information Coefficient (Spearman rank correlation) between the learned score
+and actual returns, along with a bootstrapped mean/std to gauge statistical
+significance.  These metrics are written to `evaluation.txt` and printed to
+the console.
+
+The textual model itself now stacks features (management sentiment, Q&A
+sentiment, obfuscation density, numeric/outlook heuristics) into a simple
+Ridge regression *meta‑model* rather than averaging them by hand.  This lets
+the algorithm learn which parts of a call are most predictive.
+
 These heuristics aren’t mandatory, but they help focus the model on parts of
 calls that are most likely to explain future stock movement.  The intermediate
 CSV files written to the output directory now include `has_future_outlook` and
@@ -71,9 +93,10 @@ transcripts_df = di.fetch_transcripts_seekingalpha("AAPL")
 
 # Option 2 – use the `earningscall` library, which provides an API wrapper
 # around a commercial transcript database.  Basic transcripts are free to
-# query; you can also filter by year/quarter.
+# query; you can also filter by year/quarter.  To avoid the script hanging on
+# a single slow API call you can specify a per-request timeout (seconds).
 # di = DataIngestion()
-# transcripts_df = di.fetch_transcripts_earningscall("AAPL", years=[2024])
+# transcripts_df = di.fetch_transcripts_earningscall("AAPL", years=[2024], timeout=30)
 
 # save if you want a CSV for the pipeline
 transcripts_df.to_csv("data/aapl_transcripts.csv", index=False)

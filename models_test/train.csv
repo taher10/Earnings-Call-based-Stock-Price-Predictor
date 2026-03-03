@@ -1,1 +1,4 @@
-ticker,date,before_close,after_close,window_return,has_future_outlook,numeric_count,future_return,label,transcript
+date,ticker,before_close,after_close,window_return,has_future_outlook,numeric_count,future_return,volatility,vol_adj_return,label,transcript
+2020-01-28,AAPL,300.0,315.0,0.05,True,0,0.05,0.0,,2,we had a strong quarter with higher service revenue and good iphone demand outlook is positive
+2020-04-30,AAPL,280.0,269.0,-0.039285714285714285,False,0,-0.039285714285714285,0.11392275919116605,-0.3448451790023062,0,supply chain issue impacted production demand remains resilient but near term headwind exist
+2020-07-30,AAPL,380.0,372.0,-0.021052631578947368,False,0,-0.021052631578947368,0.23258437030143417,-0.0905161062700074,0,record revenue driven by new product launch and strong ecosystem engagement
