@@ -14,16 +14,20 @@ FINANCIAL_STOP_WORDS = [
     # Forward-looking statements
     "forward", "looking", "forward-looking", "statements", "statement",
     # Time references
-    "quarter", "quarterly", "year", "annual", "annually",
+    "quarter", "quarterly", "year", "annual", "annually", "fiscal",
     # Financial metrics (too common)
     "earnings", "revenue", "gross", "margin", "margins",
     "fy", "q1", "q2", "q3", "q4",
-    # Conference/presentation artifacts
+    # Conference/presentation artifacts & operator phrases
     "conference", "call", "participants", "operator", "question",
+    "thank", "thanks", "thank you", "everyone", "joined", "joined us",
+    "welcome", "good morning", "good afternoon", "good evening",
+    "please", "next", "please next", "next please", "next question please",
+    "question please", "question please next", "operator please",
     # Filler words and non-substantive speech
     "uh", "um", "ah", "er", "basically", "really", "just", "like", "kind", "sort", "obviously",
     # Common operators/question phrasing
-    "question is from", "next question", "operator", "thanks", "thank",
+    "question is from", "next question", "thanks", "thank",
     # Generic verbs/pronouns
     "see", "saw", "seen", "say", "said", "says",
     "believe", "believes", "believed",
@@ -268,6 +272,7 @@ class TextModel:
                         feats["obfuscation_penalty"],
                         feats["numeric_count"],
                         float(feats.get("outlook_flag", 0)),
+                        float(feats.get("qa_complexity", 0)),
                     ])
                     y_meta.append(row[return_col])
                 X_meta = _np.array(X_meta)
@@ -364,6 +369,10 @@ class TextModel:
         mgmt_text, qa_text = dc.extract_qa_section(text)
         qa_hedging_density = dc.measure_hedging_density(qa_text) if qa_text else 0.0
         obfuscation_penalty = 1.0 - (qa_hedging_density * 0.5)
+        
+        # Linguistic complexity (entropy) - average sentence length in Q&A
+        # High complexity (long sentences) suggests defensiveness/evasion
+        qa_complexity = dc.measure_linguistic_complexity(qa_text) if qa_text else 0.0
 
         tfidf_vec = self.pipeline.named_steps["tfidf"]
         clf = self.pipeline.named_steps["clf"]
@@ -395,6 +404,7 @@ class TextModel:
             "obfuscation_penalty": float(obfuscation_penalty),
             "numeric_count": float(numeric_count),
             "outlook_flag": float(outlook_flag),
+            "qa_complexity": float(qa_complexity),
         }
         return result
 
@@ -773,6 +783,9 @@ class TextModel:
             # Measure management obfuscation in Q&A section
             qa_hedging_density = dc.measure_hedging_density(qa_text) if qa_text else 0.0
             obfuscation_penalty = 1.0 - (qa_hedging_density * 0.5)  # 50% penalty for max hedging
+            
+            # Measure linguistic complexity (entropy) - average sentence length in Q&A
+            qa_complexity = dc.measure_linguistic_complexity(qa_text) if qa_text else 0.0
 
             
             # Vectorize both sections separately
@@ -844,6 +857,7 @@ class TextModel:
                         obfuscation_penalty,
                         float(num_count),
                         float(outlook_flag),
+                        float(qa_complexity),
                     ]])
                     # Apply the same scaling that was used during training
                     if self.meta_scaler is not None:

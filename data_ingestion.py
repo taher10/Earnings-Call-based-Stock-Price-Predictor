@@ -360,6 +360,45 @@ class DataIngestion:
 
         labels = t.apply(label_row, axis=1)
         out = pd.concat([t.reset_index(drop=True), labels.reset_index(drop=True)], axis=1)
+        
+        # Winsorize residual returns to handle outliers (clip at 5th/95th percentiles)
+        # This prevents black swan events from skewing feature weights
+        if "residual_return" in out.columns:
+            residual_vals = out["residual_return"].dropna()
+            if len(residual_vals) > 0:
+                lower_bound = residual_vals.quantile(0.05)
+                upper_bound = residual_vals.quantile(0.95)
+                out["residual_return_winsorized"] = out["residual_return"].clip(lower=lower_bound, upper=upper_bound)
+            else:
+                out["residual_return_winsorized"] = out["residual_return"]
+        
+        # Compute Z-score of residual returns for statistically significant labeling
+        # This ensures BUY/SELL signals only trigger when outperformance is significant
+        if "residual_return" in out.columns:
+            residual_vals = out["residual_return"].dropna()
+            if len(residual_vals) > 1:
+                mean_residual = residual_vals.mean()
+                std_residual = residual_vals.std()
+                if std_residual > 0:
+                    out["residual_zscore"] = (out["residual_return"] - mean_residual) / std_residual
+                    # Re-label based on Z-score instead of raw residual return
+                    # pct_threshold now interpreted as Z-score threshold (e.g., 2.0 = 2 standard deviations)
+                    def _relabel_zscore(row):
+                        if pd.notna(row.get("residual_zscore")):
+                            zscore = row["residual_zscore"]
+                            if zscore >= pct_threshold:
+                                return 1  # BUY
+                            elif zscore <= -pct_threshold:
+                                return 0  # SELL
+                            else:
+                                return 2  # HOLD
+                        else:
+                            return row.get("label", 2)
+                    out["label"] = out.apply(_relabel_zscore, axis=1)
+                else:
+                    out["residual_zscore"] = 0.0
+            else:
+                out["residual_zscore"] = None
 
         # annotate transcripts with a few simple text indicators that may be
         # useful for filtering or model features.  the naming and logic here are

@@ -149,6 +149,37 @@ class DataCleaning:
         density = min(hedging_count / word_count, 1.0)  # Cap at 1.0
         return density
 
+    def measure_linguistic_complexity(self, text: str) -> float:
+        """Measure linguistic complexity (entropy) via average sentence length.
+        
+        Hedge funds use this as a proxy for "Management Defensiveness"—if a CEO
+        starts using very long, complex sentences to answer a simple question,
+        it's often a bearish signal. Long rambling answers suggest evasion.
+        
+        Returns:
+            Average sentence length in words (0.0 if text empty)
+        """
+        if not isinstance(text, str) or len(text) == 0:
+            return 0.0
+        
+        # Split into sentences using common punctuation
+        # This is a simple heuristic; more sophisticated NLP could use spaCy
+        sentence_endings = r'[.!?]+'
+        sentences = re.split(sentence_endings, text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        if not sentences:
+            return 0.0
+        
+        # Measure average sentence length (in words)
+        total_words = 0
+        for sentence in sentences:
+            words = sentence.split()
+            total_words += len(words)
+        
+        avg_sentence_length = total_words / len(sentences)
+        return avg_sentence_length
+
     def extract_guidance_and_results(self, text: str) -> Tuple[str, str]:
         """Extract 'Guidance/Outlook' section and 'Results' section for divergence detection.
         
