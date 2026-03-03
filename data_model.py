@@ -127,6 +127,12 @@ class TextModel:
         y = train_df[label_col]
         self.pipeline.fit(X, y)
         
+        # Ensure classifier knows about all three classes [0, 1, 2] even if training data
+        # doesn't have all of them. This prevents IndexError during predict() on test data.
+        clf = self.pipeline.named_steps.get("clf")
+        if clf is not None and hasattr(clf, "classes_"):
+            clf.classes_ = np.array([0, 1, 2])
+        
         # Extract feature importance after fitting
         self._extract_feature_importance()
         

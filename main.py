@@ -392,7 +392,6 @@ def train(args):
         # save predictions/probabilities to CSV when a test set exists
         if not test_df.empty:
             X = test_df["transcript"].fillna("").tolist()
-            preds = tm.pipeline.predict(X)
             
             # Build simplified results with only essential columns
             results = pd.DataFrame({
@@ -404,13 +403,17 @@ def train(args):
                 'guidance_divergence': test_df['guidance_divergence'].values,
             })
             
-            # Add class probabilities if available
-            if hasattr(tm.pipeline, "predict_proba"):
-                probs = tm.pipeline.predict_proba(X)
-                # Assuming classes are [0, 1, 2] for [SELL, BUY, HOLD]
-                results['prob_sell'] = probs[:, 0]
-                results['prob_buy'] = probs[:, 1]
-                results['prob_hold'] = probs[:, 2]
+            # Add class probabilities if available (wrapped in try-except to handle classifier edge cases)
+            try:
+                if hasattr(tm.pipeline, "predict_proba"):
+                    probs = tm.pipeline.predict_proba(X)
+                    # Assuming classes are [0, 1, 2] for [SELL, BUY, HOLD]
+                    if probs.shape[1] >= 3:
+                        results['prob_sell'] = probs[:, 0]
+                        results['prob_buy'] = probs[:, 1]
+                        results['prob_hold'] = probs[:, 2]
+            except Exception as e:
+                print(f"Warning: Could not compute probabilities: {e}")
             
             results_path = out_dir / "results.csv"
             results.to_csv(results_path, index=False)
