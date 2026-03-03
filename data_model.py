@@ -1,6 +1,7 @@
 from typing import Optional, Tuple, Dict, List
 import pandas as pd
 import joblib
+import re
 from sklearn.pipeline import Pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
@@ -178,6 +179,49 @@ class TextModel:
         else:
             return 0.0
 
+    def _sentence_level_sentiment(self, text: str) -> float:
+        """Compute sentiment by scoring individual sentences and taking median.
+        
+        This approach reduces the impact of outlier sentences and stabilizes variance
+        compared to bag-of-words aggregation.
+        
+        Args:
+            text: The transcript text to score
+            
+        Returns:
+            float: Median sentiment score across all sentences
+        """
+        # Split into sentences using common sentence terminators
+        sentences = re.split(r'[.!?]+', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        if not sentences:
+            return 0.0
+        
+        # Get TF-IDF vectorizer and classifier from pipeline
+        tfidf_vec = self.pipeline.named_steps["tfidf"]
+        clf = self.pipeline.named_steps["clf"]
+        
+        # Score each sentence individually
+        sentence_scores = []
+        for sentence in sentences:
+            if len(sentence) < 10:  # Skip very short sentences (noise)
+                continue
+            try:
+                vec = tfidf_vec.transform([sentence])
+                raw_score = clf.decision_function(vec)
+                sentiment = self._scores_to_sentiment(raw_score)
+                sentence_scores.append(sentiment)
+            except Exception:
+                # Skip sentences that fail to vectorize
+                continue
+        
+        if not sentence_scores:
+            return 0.0
+        
+        # Return median to reduce outlier impact
+        return float(np.median(sentence_scores))
+
     def fit(self, train_df: pd.DataFrame, text_col: str = "transcript", label_col: str = "label", return_col: str = "future_return"):
         # similar to ``evaluate``, guard against a DataFrame being returned
         # when pandas finds multiple columns with the same name.  this can
@@ -285,6 +329,9 @@ class TextModel:
                 self.meta_model = Ridge(alpha=1.0)
                 self.meta_model.fit(X_meta_scaled, y_meta)
                 print("Meta-model trained on", len(y_meta), "examples (with z-score scaling)")
+                
+                # Feature importance pruning: Zero out bottom 50% of meta-model coefficients
+                self._prune_meta_features()
         except Exception as e:
             print(f"Warning: could not train meta-model: {e}")
             self.meta_model = None
@@ -321,6 +368,45 @@ class TextModel:
         except Exception as e:
             print(f"Could not extract feature importance: {e}")
             self.feature_importance = None
+
+    def _prune_meta_features(self):
+        """Prune meta-model features by zeroing out bottom 50% by coefficient magnitude.
+        
+        This reduces noise from weak features and stabilizes bootstrap variance.
+        Feature names: [full_sentiment, mgmt_sentiment, qa_sentiment, obfuscation_penalty,
+                        numeric_count, outlook_flag, qa_complexity]
+        """
+        if self.meta_model is None:
+            return
+        
+        try:
+            # Get meta-model coefficients
+            coefs = self.meta_model.coef_
+            
+            # Calculate absolute magnitudes
+            coef_magnitudes = np.abs(coefs)
+            
+            # Find 50th percentile (median)
+            threshold = np.percentile(coef_magnitudes, 50)
+            
+            # Create mask: keep features above threshold, zero out below
+            mask = coef_magnitudes >= threshold
+            
+            # Apply pruning by zeroing out weak coefficients
+            self.meta_model.coef_ = coefs * mask
+            
+            # Report pruning statistics
+            pruned_count = np.sum(~mask)
+            kept_count = np.sum(mask)
+            feature_names = ["full_sentiment", "mgmt_sentiment", "qa_sentiment", 
+                           "obfuscation_penalty", "numeric_count", "outlook_flag", "qa_complexity"]
+            
+            print(f"Feature importance pruning: kept {kept_count}, pruned {pruned_count} features (50th percentile)")
+            print(f"  Kept features: {[feature_names[i] for i in range(len(mask)) if mask[i]]}")
+            print(f"  Pruned features: {[feature_names[i] for i in range(len(mask)) if not mask[i]]}")
+            
+        except Exception as e:
+            print(f"Warning: could not prune meta-model features: {e}")
 
     def _apply_temporal_decay(self, feature_name: str, current_date: pd.Timestamp, decay_rate: float = 0.05) -> float:
         """Apply exponential decay to feature importance based on age.
@@ -796,23 +882,14 @@ class TextModel:
             # Get coefficients for the logistic regression model
             clf = self.pipeline.named_steps["clf"]
 
-            full_vec = tfidf_vec.transform([text])
-            raw_full = clf.decision_function(full_vec)
-            full_sentiment = self._scores_to_sentiment(raw_full)
-
-            # Management section score
-            raw_mgmt = clf.decision_function(mgmt_vec)
-            mgmt_sentiment = self._scores_to_sentiment(raw_mgmt)
+            # Use sentence-level aggregation (median) instead of bag-of-words
+            full_sentiment = self._sentence_level_sentiment(text)
+            mgmt_sentiment = self._sentence_level_sentiment(mgmt_text)
+            qa_sentiment = self._sentence_level_sentiment(qa_text) if qa_text.strip() else 0.0
             
-            # Q&A section score (double the weight for negative sentiment, aka "stress")
-            qa_sentiment = 0.0
-            if qa_vec is not None and qa_text.strip():
-                raw_qa = clf.decision_function(qa_vec)
-                qa_sentiment = self._scores_to_sentiment(raw_qa)
-                
-                # If negative sentiment detected in Q&A, double the penalty (stress metric)
-                if qa_sentiment < 0:
-                    qa_sentiment *= 2.0
+            # If negative sentiment detected in Q&A, double the penalty (stress metric)
+            if qa_sentiment < 0:
+                qa_sentiment *= 2.0
             
             # Combine section scores using configurable weights
             section_sentiment = (

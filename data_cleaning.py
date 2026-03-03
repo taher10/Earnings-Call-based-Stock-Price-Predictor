@@ -47,6 +47,20 @@ PRODUCT_NAMES = {
 }
 
 
+# Vocal tic filtering: bigrams and trigrams to remove
+VOCAL_TIC_BIGRAMS = [
+    "have have", "absolutely absolutely", "operator next", "next please",
+    "please next", "thank you", "you know", "i mean", "you see",
+]
+
+VOCAL_TIC_TRIGRAMS = [
+    "have have have", "absolutely absolutely absolutely",
+    "operator next please", "please next please",
+]
+
+# Minimum word length threshold (filters 'll', 'um', 've', etc.)
+MIN_WORD_LENGTH = 4
+
 
 # keep a module‑level flag so we only download once per session; the NLTK
 # check is relatively expensive and was causing repeated log spam during
@@ -235,7 +249,20 @@ class DataCleaning:
         # simple lemmatization using regex tokenization to avoid heavy NLTK downloads
         tokens = re.findall(r"\w+", text)
         lem = [self.lemmatizer.lemmatize(t) for t in tokens]
+        
+        # Apply minimum word length filter (removes 'll', 'um', 've', etc.)
+        lem = [t for t in lem if len(t) >= MIN_WORD_LENGTH]
+        
         cleaned = " ".join(lem)
+        
+        # Remove vocal tic trigrams first (longer phrases take priority)
+        for trigram in VOCAL_TIC_TRIGRAMS:
+            cleaned = cleaned.replace(trigram, " ")
+        
+        # Remove vocal tic bigrams
+        for bigram in VOCAL_TIC_BIGRAMS:
+            cleaned = cleaned.replace(bigram, " ")
+        
         # collapse any remaining runs of whitespace (including newlines)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned

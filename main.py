@@ -489,11 +489,11 @@ if __name__ == '__main__':
     # running ``python main.py`` with no arguments actually gives a test set
     parser.add_argument("--train-until", dest="train_until", default="2020-06-01")
     parser.add_argument("--days-forward", type=int, default=7)
-    parser.add_argument("--pct-threshold", type=float, default=2.0,
+    parser.add_argument("--pct-threshold", type=float, default=1.0,
                         help=(
-                            "threshold in units of volatility multiples used for labeling. "
-                            "e.g. 2.0 means returns \u22652 sigma are labeled BUY, <=-2 sigma SELL. "
-                            "(default 2.0, roughly equivalent to 2% when vol ~1%)"
+                            "threshold in units of standard deviations for residual return labeling. "
+                            "e.g. 1.0 means residual returns ≥1 sigma are labeled BUY, <=-1 sigma SELL. "
+                            "(default 1.0, volatility-adjusted for institutional-grade threshold)"
                         ))
     parser.add_argument(
         "--days-before",
