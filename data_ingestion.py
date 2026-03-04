@@ -1,5 +1,6 @@
 import os
 import re
+from pathlib import Path
 from typing import Optional, List
 import pandas as pd
 
@@ -34,6 +35,112 @@ class DataIngestion:
 
     def __init__(self):
         pass
+
+    def _transcript_cache_dir(self) -> Path:
+        return Path(__file__).resolve().parent / "data" / "transcripts" / "cache"
+
+    def _transcript_cache_path(self, ticker: str, year: int, quarter: int) -> Path:
+        t = str(ticker).upper().strip()
+        return self._transcript_cache_dir() / f"{t}_{int(year)}_Q{int(quarter)}.csv"
+
+    def _load_cached_transcript(
+        self,
+        ticker: str,
+        year: int,
+        quarter: int,
+    ) -> Optional[dict]:
+        path = self._transcript_cache_path(ticker, year, quarter)
+        if not path.exists():
+            return None
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            return None
+        if df.empty:
+            return None
+        row = df.iloc[0]
+        txt = row.get("transcript")
+        if pd.isna(txt) or txt is None:
+            txt = row.get("content")
+        if pd.isna(txt) or txt is None:
+            return None
+        dt = row.get("date")
+        if pd.isna(dt) or dt is None:
+            return None
+        return {
+            "ticker": str(row.get("ticker", ticker)).upper(),
+            "year": int(row.get("year", year)),
+            "quarter": int(row.get("quarter", quarter)),
+            "date": pd.to_datetime(dt, utc=True).tz_convert(None),
+            "transcript": str(txt),
+            "content": str(row.get("content", txt)),
+        }
+
+    def _save_cached_transcript(self, row: dict) -> None:
+        cache_dir = self._transcript_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        out = pd.DataFrame([
+            {
+                "ticker": str(row["ticker"]).upper(),
+                "year": int(row["year"]),
+                "quarter": int(row["quarter"]),
+                "date": pd.to_datetime(row["date"], utc=True).tz_convert(None),
+                "transcript": str(row["transcript"]),
+                "content": str(row.get("content", row["transcript"])),
+            }
+        ])
+        out.to_csv(
+            self._transcript_cache_path(out.iloc[0]["ticker"], out.iloc[0]["year"], out.iloc[0]["quarter"]),
+            index=False,
+        )
+
+    def _normalize_yfinance_download(self, data: pd.DataFrame, ticker: Optional[str] = None) -> pd.DataFrame:
+        """Return a normalized dataframe with ``date`` and scalar ``close`` columns.
+
+        Recent ``yfinance`` versions can return MultiIndex columns even for a single
+        ticker (for example ``("Close", "AAPL")`` and ``("Close", "MSFT")``), and
+        selecting ``"Close"`` directly can produce a DataFrame instead of a Series.
+        This helper flattens that output into one close series for the requested ticker.
+        """
+        df = data.copy()
+
+        # flatten MultiIndex columns to simple strings where possible
+        if isinstance(df.columns, pd.MultiIndex):
+            if ticker is not None and ("Close", ticker) in df.columns:
+                close_series = df[("Close", ticker)]
+            elif ("Close", "") in df.columns:
+                close_series = df[("Close", "")]
+            else:
+                close_cols = [c for c in df.columns if str(c[0]).lower() == "close"]
+                if not close_cols:
+                    raise ValueError("yfinance response did not include a Close column")
+                close_series = df[close_cols[0]]
+            out = pd.DataFrame({"close": close_series.values}, index=df.index)
+        else:
+            # normal single-level output
+            close_col = None
+            for c in df.columns:
+                if str(c).lower() == "close":
+                    close_col = c
+                    break
+            if close_col is None:
+                raise ValueError("yfinance response did not include a Close column")
+            out = pd.DataFrame({"close": pd.to_numeric(df[close_col], errors="coerce")}, index=df.index)
+
+        out = out.reset_index()
+        # yfinance may expose date index as Date/Datetime/index depending on source
+        date_col = None
+        for candidate in ("Date", "Datetime", "index"):
+            if candidate in out.columns:
+                date_col = candidate
+                break
+        if date_col is None:
+            date_col = out.columns[0]
+        out = out.rename(columns={date_col: "date"})
+        out["date"] = pd.to_datetime(out["date"])
+        out["close"] = pd.to_numeric(out["close"], errors="coerce")
+        out = out.dropna(subset=["date", "close"])
+        return out[["date", "close"]]
 
     def load_transcripts_csv(self, path: str) -> pd.DataFrame:
         """Load transcripts CSV with at least columns: `company` (or `ticker`),
@@ -76,9 +183,8 @@ class DataIngestion:
         if yf is None:
             raise ImportError("yfinance is required for fetch_prices_yfinance; install with `pip install yfinance`")
         data = yf.download(ticker, start=start, end=end, progress=False)
-        data = data.reset_index()[["Date", "Close"]].rename(columns={"Date": "date", "Close": "close"})
+        data = self._normalize_yfinance_download(data, ticker=ticker)
         data["ticker"] = ticker
-        data["date"] = pd.to_datetime(data["date"])
         return data[["date", "ticker", "close"]]
 
     def fetch_spy_prices(self, start: str, end: str) -> pd.DataFrame:
@@ -91,8 +197,7 @@ class DataIngestion:
         if yf is None:
             raise ImportError("yfinance is required for fetch_spy_prices; install with `pip install yfinance`")
         data = yf.download("SPY", start=start, end=end, progress=False)
-        data = data.reset_index()[["Date", "Close"]].rename(columns={"Date": "date", "Close": "close"})
-        data["date"] = pd.to_datetime(data["date"])
+        data = self._normalize_yfinance_download(data, ticker="SPY")
         return data[["date", "close"]]
 
     def _has_future_outlook(self, text: str) -> bool:
@@ -153,6 +258,7 @@ class DataIngestion:
 
         Requires ``earningscall`` to be installed; raises ``ImportError`` if not.
         """
+        ticker = str(ticker).upper().strip()
         ec = _try_import_earningscall()
         if ec is None:
             raise ImportError(
@@ -164,27 +270,45 @@ class DataIngestion:
             raise ValueError(f"ticker {ticker} not found via earningscall")
 
         rows = []
-        # ``today`` as a timezone-naive timestamp; event dates may have
-        # tzinfo so we'll normalize both sides before comparing.
         today = pd.Timestamp.utcnow().tz_convert(None)
+
+        seen = set()
+        missing = []
+        cache_hits = 0
+
         for ev in company.events():
             if years and ev.year not in years:
                 continue
             if quarters and ev.quarter not in quarters:
                 continue
-            # fetch the text, enforcing the user-specified timeout if provided
+
+            y = int(ev.year)
+            q = int(ev.quarter)
+            key = (ticker, y, q)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            cached = self._load_cached_transcript(ticker, y, q)
+            if cached is not None:
+                if pd.to_datetime(cached["date"], utc=True).tz_convert(None) <= today:
+                    rows.append(cached)
+                    cache_hits += 1
+                continue
+
+            missing.append((ev, y, q))
+
+        for ev, y, q in missing:
             try:
                 if timeout is not None:
                     import concurrent.futures
 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                        # call using keyword to match original signature
                         future = executor.submit(company.get_transcript, event=ev)
                         tr = future.result(timeout=timeout)
                 else:
                     tr = company.get_transcript(event=ev)
-            except Exception as exc:  # include TimeoutError and network errors
-                # so that a single bad request doesn't abort the whole loop
+            except Exception as exc:
                 print(f"warning: could not fetch transcript for event {ev}: {exc}")
                 continue
 
@@ -193,20 +317,36 @@ class DataIngestion:
             date = ev.conference_date if ev.conference_date is not None else pd.to_datetime(
                 f"{ev.year}-{(ev.quarter - 1) * 3 + 1}-01"
             )
-            # skip transcripts dated in the future; many corporate calendars
-            # contain events scheduled well in advance which don't have an actual
-            # transcript yet.
-            if pd.to_datetime(date, utc=True).tz_convert(None) > today:
+            dt = pd.to_datetime(date, utc=True).tz_convert(None)
+            if dt > today:
                 continue
-            rows.append({"company": ticker, "date": date, "transcript": tr.text})
+
+            row = {
+                "ticker": ticker,
+                "year": y,
+                "quarter": q,
+                "date": dt,
+                "transcript": tr.text,
+                "content": tr.text,
+            }
+            rows.append(row)
+            self._save_cached_transcript(row)
+
+        if cache_hits > 0 or len(missing) > 0:
+            print(
+                f"Transcript cache: loaded {cache_hits} from cache, "
+                f"fetched {max(len(rows) - cache_hits, 0)} via API for {ticker}"
+            )
+
         df = pd.DataFrame(rows)
         if not df.empty:
-            # normalize timezone information exactly like load_transcripts_csv
             df["date"] = pd.to_datetime(df["date"], utc=True)
             df["date"] = df["date"].dt.tz_convert(None)
-            # align column name with rest of pipeline
-            if "company" in df.columns and "ticker" not in df.columns:
-                df = df.rename(columns={"company": "ticker"})
+            required_cols = ["ticker", "year", "quarter", "date", "transcript", "content"]
+            for col in required_cols:
+                if col not in df.columns:
+                    df[col] = None
+            df = df[required_cols]
         return df
 
     def compute_volatility(self, prices: pd.DataFrame, as_of: pd.Timestamp, window: int = 30) -> Optional[float]:

@@ -9,6 +9,130 @@ from data_cleaning import DataCleaning
 from data_model import TextModel
 
 
+MAG7_TICKERS = ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA"]
+
+
+def _sp500_tickers_from_wikipedia() -> list[str]:
+    """Return S&P 500 ticker list from Wikipedia table.
+
+    Symbols that use dots in listings (e.g., BRK.B) are normalized to dashes
+    (BRK-B), which is the convention most market APIs expect.
+    """
+    out = []
+    # First attempt: Wikipedia HTML table (requires lxml/html parser support)
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(url)
+        if tables and "Symbol" in tables[0].columns:
+            out = (
+                tables[0]["Symbol"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .str.replace(".", "-", regex=False)
+                .tolist()
+            )
+    except Exception:
+        out = []
+
+    # Fallback: public CSV sources that don't require HTML parsing extras.
+    if not out:
+        csv_urls = [
+            "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv",
+            "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
+        ]
+        for csv_url in csv_urls:
+            try:
+                df = pd.read_csv(csv_url)
+                symbol_col = None
+                for col in df.columns:
+                    if str(col).strip().lower() == "symbol":
+                        symbol_col = col
+                        break
+                if symbol_col is None:
+                    continue
+                out = (
+                    df[symbol_col]
+                    .dropna()
+                    .astype(str)
+                    .str.strip()
+                    .str.upper()
+                    .str.replace(".", "-", regex=False)
+                    .tolist()
+                )
+                if out:
+                    break
+            except Exception:
+                continue
+
+    # preserve order while deduplicating
+    return list(dict.fromkeys(out))
+
+
+def cache_transcripts_universe(args):
+    """Bulk-populate transcript cache for a broad ticker universe.
+
+    This mode attempts each ticker and lets DataIngestion handle cache-first fetches
+    and per-quarter CSV writes. Tickers requiring paid API access are skipped.
+    """
+    di = DataIngestion()
+
+    import datetime
+    if args.start_year is not None and args.end_year is not None:
+        years = list(range(args.start_year, args.end_year + 1))
+    else:
+        current = datetime.datetime.now().year
+        years = list(range(current - 5, current))
+
+    tickers = _sp500_tickers_from_wikipedia()
+    if not tickers:
+        raise RuntimeError("could not load S&P 500 ticker list from Wikipedia")
+
+    if args.max_tickers is not None and args.max_tickers > 0:
+        tickers = tickers[: args.max_tickers]
+
+    print(f"Loaded {len(tickers)} S&P 500 ticker(s) for cache pass (years={years})")
+
+    success = 0
+    no_data = 0
+    restricted = 0
+    errors = 0
+    total_rows = 0
+
+    for idx, ticker in enumerate(tickers, start=1):
+        try:
+            df = di.fetch_transcripts_earningscall(
+                ticker,
+                years=years,
+                timeout=args.fetch_timeout,
+            )
+            rows = 0 if df is None else len(df)
+            total_rows += rows
+            if rows > 0:
+                success += 1
+                print(f"[{idx}/{len(tickers)}] {ticker}: cached/loaded {rows} transcript(s)")
+            else:
+                no_data += 1
+                print(f"[{idx}/{len(tickers)}] {ticker}: no transcripts returned")
+        except Exception as exc:
+            msg = str(exc)
+            if "requires an API Key" in msg:
+                restricted += 1
+                print(f"[{idx}/{len(tickers)}] {ticker}: skipped (API key restricted)")
+            else:
+                errors += 1
+                print(f"[{idx}/{len(tickers)}] {ticker}: error ({exc})")
+
+    print("\nCache pass summary:")
+    print(f"  tickers attempted: {len(tickers)}")
+    print(f"  tickers with transcripts: {success}")
+    print(f"  tickers with no rows: {no_data}")
+    print(f"  tickers restricted by API key: {restricted}")
+    print(f"  tickers with other errors: {errors}")
+    print(f"  total transcript rows loaded/fetched: {total_rows}")
+
+
 def train(args):
     di = DataIngestion()
     dc = DataCleaning()
@@ -21,20 +145,46 @@ def train(args):
     # load or fetch transcripts
     transcripts = None
 
-    if args.fetch_ticker:
+    requested_tickers = []
+    if args.fetch_tickers:
+        requested_tickers = [t.strip().upper() for t in args.fetch_tickers.split(",") if t.strip()]
+    elif args.fetch_mag7:
+        requested_tickers = MAG7_TICKERS.copy()
+    elif args.fetch_ticker:
+        requested_tickers = [args.fetch_ticker.strip().upper()]
+
+    if requested_tickers:
         # user explicitly asked for live data
         years = None
         if args.start_year is not None and args.end_year is not None:
             years = list(range(args.start_year, args.end_year + 1))
-        transcripts = di.fetch_transcripts_earningscall(
-            args.fetch_ticker,
-            years=years,
-            timeout=args.fetch_timeout,
-        )
-        if transcripts is None or (hasattr(transcripts, "empty") and transcripts.empty):
-            print(f"Fetched transcripts for {args.fetch_ticker} (years={years}) but got none")
         else:
-            print(f"Fetched {len(transcripts)} transcripts for {args.fetch_ticker} (years={years})")
+            # default to the most recent five completed years (same period as auto sample mode)
+            import datetime
+            current = datetime.datetime.now().year
+            years = list(range(current - 5, current))
+
+        fetched = []
+        for ticker in requested_tickers:
+            try:
+                one = di.fetch_transcripts_earningscall(
+                    ticker,
+                    years=years,
+                    timeout=args.fetch_timeout,
+                )
+                if one is None or (hasattr(one, "empty") and one.empty):
+                    print(f"Fetched transcripts for {ticker} (years={years}) but got none")
+                    continue
+                print(f"Fetched {len(one)} transcripts for {ticker} (years={years})")
+                fetched.append(one)
+            except Exception as exc:
+                print(f"warning: failed to fetch transcripts for {ticker}: {exc}")
+
+        if fetched:
+            transcripts = pd.concat(fetched, ignore_index=True)
+            print(f"Fetched total {len(transcripts)} transcripts across {len(fetched)} tickers")
+        else:
+            transcripts = pd.DataFrame()
     else:
         # maybe use the sample CSV or auto‑fetch when the default is requested
         default_sample = "data/sample_aapl_transcripts.csv"
@@ -72,19 +222,30 @@ def train(args):
     # via yfinance so that alignment actually produces rows.
     default_price = "data/sample_aapl_prices.csv"
     if transcripts is not None and args.prices == default_price:
-        # determine ticker from transcripts
-        ticker = None
+        # determine tickers from transcripts
+        tickers = []
         if "ticker" in transcripts.columns:
-            ticker = transcripts["ticker"].iloc[0]
-        if ticker:
+            tickers = sorted(transcripts["ticker"].dropna().astype(str).str.upper().unique().tolist())
+        if tickers:
             try:
                 start = transcripts["date"].min().strftime("%Y-%m-%d")
                 end = transcripts["date"].max().strftime("%Y-%m-%d")
-                prices = di.fetch_prices_yfinance(ticker, start=start, end=end)
+                price_frames = []
+                for ticker in tickers:
+                    one_prices = di.fetch_prices_yfinance(ticker, start=start, end=end)
+                    if one_prices is not None and not one_prices.empty:
+                        price_frames.append(one_prices)
+                if price_frames:
+                    prices = pd.concat(price_frames, ignore_index=True)
+                else:
+                    prices = di.load_stock_csv(args.prices)
                 prices.to_csv(out_dir / "input_prices.csv", index=False)
-                print(f"Auto-fetched prices for {ticker} ({len(prices)} rows)")
+                print(f"Auto-fetched prices for {len(tickers)} ticker(s), {len(prices)} rows")
             except ImportError:
                 print("yfinance not installed; using sample prices")
+                prices = di.load_stock_csv(args.prices)
+            except Exception as exc:
+                print(f"warning: could not auto-fetch all prices ({exc}); using sample prices")
                 prices = di.load_stock_csv(args.prices)
         else:
             prices = di.load_stock_csv(args.prices)
@@ -262,25 +423,25 @@ def train(args):
     if model_trained and not test_df_future.empty:
         print(f"\nScoring {len(test_df_future)} future transcripts using learned weights...")
         print("(with temporal decay, entity masking, Q&A stress, sentiment velocity, and obfuscation metrics)")
-        
-        # Get ticker from transcripts
-        ticker = None
-        if "ticker" in test_df_future.columns:
-            ticker = test_df_future["ticker"].iloc[0]
-        if ticker is None:
-            ticker = "AAPL"  # Default fallback
-        
-        # Tune dynamic decile thresholds using rolling 8-quarter window
         print(f"\nCalculating dynamic decile thresholds (rolling 8-quarter window)...")
-        threshold_buy, threshold_sell = tm.tune_thresholds_dynamic_decile(ticker, lookback_quarters=8)
+
+        threshold_cache = {}
+
+        def _get_thresholds(row_ticker: str):
+            t = row_ticker if row_ticker else "AAPL"
+            if t not in threshold_cache:
+                threshold_cache[t] = tm.tune_thresholds_dynamic_decile(t, lookback_quarters=8)
+            return threshold_cache[t], t
         
         # ADAPTIVE THRESHOLDING: If test scores are too tight, use percentiles on test data itself
         test_scores = []
         for idx, row in test_df_future.iterrows():
+            row_ticker = str(row.get("ticker", "")).upper() if pd.notna(row.get("ticker", None)) else ""
+            (threshold_buy, threshold_sell), ticker_used = _get_thresholds(row_ticker)
             diag, score, label = tm.score_and_label(
                 row["transcript"],
                 transcript_date=pd.Timestamp(row["date"]),
-                ticker=ticker,
+                ticker=ticker_used,
                 threshold_buy=threshold_buy,
                 threshold_sell=threshold_sell
             )
@@ -302,10 +463,12 @@ def train(args):
         scores_and_labels = []
         diagnostics_list = []
         for idx, row in test_df_future.iterrows():
+            row_ticker = str(row.get("ticker", "")).upper() if pd.notna(row.get("ticker", None)) else ""
+            (threshold_buy, threshold_sell), ticker_used = _get_thresholds(row_ticker)
             diag, score, label = tm.score_and_label(
                 row["transcript"],
                 transcript_date=pd.Timestamp(row["date"]),
-                ticker=ticker,
+                ticker=ticker_used,
                 threshold_buy=test_threshold_buy,
                 threshold_sell=test_threshold_sell
             )
@@ -468,6 +631,34 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        "--fetch-tickers",
+        help=(
+            "Comma-separated ticker list to fetch from earningscall (for example: AAPL,MSFT,NVDA). "
+            "Overrides --transcripts and takes precedence over --fetch-ticker."
+        ),
+    )
+    parser.add_argument(
+        "--fetch-mag7",
+        action="store_true",
+        help=(
+            "Fetch transcripts for the Magnificent 7 tickers: "
+            "AAPL, MSFT, AMZN, GOOGL, META, NVDA, TSLA. Overrides --transcripts."
+        ),
+    )
+    parser.add_argument(
+        "--cache-sp500-transcripts",
+        action="store_true",
+        help=(
+            "Attempt to fetch/cache transcripts for S&P 500 tickers using earningscall. "
+            "Only accessible tickers will be cached; API-key-restricted tickers are skipped."
+        ),
+    )
+    parser.add_argument(
+        "--max-tickers",
+        type=int,
+        help="optional cap on number of S&P 500 tickers to process in cache mode",
+    )
+    parser.add_argument(
         "--start-year",
         type=int,
         help="inclusive start year when fetching transcripts (used with --fetch-ticker)",
@@ -528,8 +719,13 @@ if __name__ == '__main__':
 
     # ensure the paths exist before we dive into training, gives a clearer
     # message than argparse's SystemExit 2.
-    for name in ("transcripts", "prices"):
-        path = getattr(args, name)
-        if not os.path.isfile(path):
-            parser.error(f"specified {name} file does not exist: {path}")
+    if args.cache_sp500_transcripts:
+        cache_transcripts_universe(args)
+        raise SystemExit(0)
+
+    use_live_transcripts = bool(args.fetch_ticker or args.fetch_tickers or args.fetch_mag7)
+    if not use_live_transcripts and not os.path.isfile(args.transcripts):
+        parser.error(f"specified transcripts file does not exist: {args.transcripts}")
+    if not os.path.isfile(args.prices):
+        parser.error(f"specified prices file does not exist: {args.prices}")
     train(args)
