@@ -39,6 +39,95 @@ class DataIngestion:
     def _transcript_cache_dir(self) -> Path:
         return Path(__file__).resolve().parent / "data" / "transcripts" / "cache"
 
+    def _kaggle_transcript_roots(self) -> List[Path]:
+        """Candidate roots for local Kaggle transcript text files."""
+        base = Path(__file__).resolve().parent / "Kaggle Dataset" / "archive"
+        return [
+            base / "cleaned_ECTs_dataset",
+            base / "NLP_Dataset" / "NLP_Dataset",
+            base / "NLP_Dataset",
+        ]
+
+    def _ticker_aliases(self, ticker: str) -> List[str]:
+        t = str(ticker).upper().strip()
+        aliases = [t]
+        manual = {
+            "GOOG": ["GOOGL"],
+            "GOOGL": ["GOOG"],
+            "META": ["FB"],
+            "FB": ["META"],
+        }
+        aliases.extend(manual.get(t, []))
+        if "-" in t:
+            aliases.append(t.replace("-", ""))
+            aliases.append(t.replace("-", "."))
+        if "." in t:
+            aliases.append(t.replace(".", ""))
+            aliases.append(t.replace(".", "-"))
+        # preserve order + dedupe
+        return list(dict.fromkeys(aliases))
+
+    def _quarter_close_timestamp(self, year: int, quarter: int) -> pd.Timestamp:
+        month = int(quarter) * 3
+        dt = pd.Timestamp(year=int(year), month=month, day=1) + pd.offsets.MonthEnd(0)
+        # Use market-close-ish timestamp, timezone naive (pipeline convention)
+        return dt + pd.Timedelta(hours=21)
+
+    def _fetch_transcripts_from_local_kaggle(
+        self,
+        ticker: str,
+        years: Optional[List[int]] = None,
+        quarters: Optional[List[int]] = None,
+    ) -> pd.DataFrame:
+        """Load transcript files from local Kaggle archive for a ticker."""
+        roots = [p for p in self._kaggle_transcript_roots() if p.exists()]
+        if not roots:
+            return pd.DataFrame(columns=["ticker", "year", "quarter", "date", "transcript", "content"])
+
+        year_filter = set(int(y) for y in years) if years else None
+        quarter_filter = set(int(q) for q in quarters) if quarters else None
+
+        parsed = {}
+        pattern = re.compile(r"(?P<year>\d{4})_Q(?P<quarter>[1-4])_(?P<sym>[a-zA-Z0-9\-\.]+)_processed\.txt$")
+
+        for root in roots:
+            for alias in self._ticker_aliases(ticker):
+                file_glob = f"**/*_{alias.lower()}_processed.txt"
+                for file_path in root.glob(file_glob):
+                    name = file_path.name
+                    match = pattern.match(name)
+                    if not match:
+                        continue
+                    year = int(match.group("year"))
+                    quarter = int(match.group("quarter"))
+                    if year_filter and year not in year_filter:
+                        continue
+                    if quarter_filter and quarter not in quarter_filter:
+                        continue
+
+                    key = (year, quarter)
+                    # Prefer files found earlier in root search order (cleaned first)
+                    if key in parsed:
+                        continue
+                    try:
+                        text = file_path.read_text(encoding="utf-8", errors="ignore").strip()
+                    except Exception:
+                        continue
+                    if not text:
+                        continue
+
+                    parsed[key] = {
+                        "ticker": str(ticker).upper().strip(),
+                        "year": year,
+                        "quarter": quarter,
+                        "date": self._quarter_close_timestamp(year, quarter),
+                        "transcript": text,
+                        "content": text,
+                    }
+
+        rows = [parsed[k] for k in sorted(parsed.keys())]
+        return pd.DataFrame(rows, columns=["ticker", "year", "quarter", "date", "transcript", "content"])
+
     def _transcript_cache_path(self, ticker: str, year: int, quarter: int) -> Path:
         t = str(ticker).upper().strip()
         return self._transcript_cache_dir() / f"{t}_{int(year)}_Q{int(quarter)}.csv"
@@ -238,116 +327,40 @@ class DataIngestion:
         quarters: Optional[List[int]] = None,
         timeout: Optional[float] = None,
     ) -> pd.DataFrame:
-        """Fetch transcripts via the *earningscall* Python library.
+        """Fetch transcripts from local Kaggle archive and hydrate cache files.
 
-        This library provides a convenient API to pull earnings call text for
-        a given ticker.  You can optionally filter by years and/or quarters and
-        also specify a per‑transcript fetch timeout to avoid hanging on a slow
-        network or an unresponsive backend.  The returned ``DataFrame`` has the
-        same columns as ``load_transcripts_csv`` and can be fed directly to
-        :meth:`align_and_label`.
-
-        ``timeout`` is interpreted as seconds passed through ``concurrent.futures``
-        and applies to each individual ``company.get_transcript`` call.  When a
-        timeout occurs the event is skipped and processing continues.
-
-        Example::
-
-            di = DataIngestion()
-            df = di.fetch_transcripts_earningscall("AAPL", years=[2024], timeout=30)
-
-        Requires ``earningscall`` to be installed; raises ``ImportError`` if not.
+        This keeps the external interface unchanged for the pipeline while switching
+        the data source from remote API pulls to local transcript text files.
         """
+        _ = timeout  # kept for backward-compatible signature
         ticker = str(ticker).upper().strip()
-        ec = _try_import_earningscall()
-        if ec is None:
-            raise ImportError(
-                "earningscall is required for fetch_transcripts_earningscall; "
-                "install with `pip install earningscall`"
-            )
-        company = ec.get_company(ticker)
-        if company is None:
-            raise ValueError(f"ticker {ticker} not found via earningscall")
 
-        rows = []
-        today = pd.Timestamp.utcnow().tz_convert(None)
+        df = self._fetch_transcripts_from_local_kaggle(
+            ticker=ticker,
+            years=years,
+            quarters=quarters,
+        )
 
-        seen = set()
-        missing = []
-        cache_hits = 0
+        if df.empty:
+            print(f"warning: no local Kaggle transcripts found for {ticker}")
+            return pd.DataFrame(columns=["ticker", "year", "quarter", "date", "transcript", "content"])
 
-        for ev in company.events():
-            if years and ev.year not in years:
-                continue
-            if quarters and ev.quarter not in quarters:
-                continue
-
-            y = int(ev.year)
-            q = int(ev.quarter)
-            key = (ticker, y, q)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            cached = self._load_cached_transcript(ticker, y, q)
-            if cached is not None:
-                if pd.to_datetime(cached["date"], utc=True).tz_convert(None) <= today:
-                    rows.append(cached)
-                    cache_hits += 1
-                continue
-
-            missing.append((ev, y, q))
-
-        for ev, y, q in missing:
-            try:
-                if timeout is not None:
-                    import concurrent.futures
-
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                        future = executor.submit(company.get_transcript, event=ev)
-                        tr = future.result(timeout=timeout)
-                else:
-                    tr = company.get_transcript(event=ev)
-            except Exception as exc:
-                print(f"warning: could not fetch transcript for event {ev}: {exc}")
-                continue
-
-            if tr is None or not hasattr(tr, "text"):
-                continue
-            date = ev.conference_date if ev.conference_date is not None else pd.to_datetime(
-                f"{ev.year}-{(ev.quarter - 1) * 3 + 1}-01"
-            )
-            dt = pd.to_datetime(date, utc=True).tz_convert(None)
-            if dt > today:
-                continue
-
-            row = {
-                "ticker": ticker,
-                "year": y,
-                "quarter": q,
-                "date": dt,
-                "transcript": tr.text,
-                "content": tr.text,
-            }
-            rows.append(row)
-            self._save_cached_transcript(row)
-
-        if cache_hits > 0 or len(missing) > 0:
-            print(
-                f"Transcript cache: loaded {cache_hits} from cache, "
-                f"fetched {max(len(rows) - cache_hits, 0)} via API for {ticker}"
+        # Ensure normalized date format and write each quarter to cache files.
+        df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_convert(None)
+        for _, row in df.iterrows():
+            self._save_cached_transcript(
+                {
+                    "ticker": row["ticker"],
+                    "year": int(row["year"]),
+                    "quarter": int(row["quarter"]),
+                    "date": row["date"],
+                    "transcript": row["transcript"],
+                    "content": row.get("content", row["transcript"]),
+                }
             )
 
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            df["date"] = pd.to_datetime(df["date"], utc=True)
-            df["date"] = df["date"].dt.tz_convert(None)
-            required_cols = ["ticker", "year", "quarter", "date", "transcript", "content"]
-            for col in required_cols:
-                if col not in df.columns:
-                    df[col] = None
-            df = df[required_cols]
-        return df
+        print(f"Local Kaggle transcripts: loaded {len(df)} row(s) for {ticker}")
+        return df[["ticker", "year", "quarter", "date", "transcript", "content"]]
 
     def compute_volatility(self, prices: pd.DataFrame, as_of: pd.Timestamp, window: int = 30) -> Optional[float]:
         """Return historical volatility (std of daily pct change) up to `as_of`.

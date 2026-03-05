@@ -297,10 +297,24 @@ def train(args):
     )
 
     # label on volatility-adjusted return instead of raw return; threshold
-    # argument is now interpreted as multiples of volatility
+    # is interpreted as z-score sigma units after cross-sectional normalization.
+    # First compute a z-score of vol_adj_return across all samples so that the
+    # threshold behaves as "N standard deviations above/below the mean"
+    # regardless of the absolute scale of returns.
+    vol_vals = df["vol_adj_return"].dropna()
+    if len(vol_vals) > 1:
+        _mean_vol = vol_vals.mean()
+        _std_vol = vol_vals.std()
+        if _std_vol > 0:
+            df["vol_adj_zscore"] = (df["vol_adj_return"] - _mean_vol) / _std_vol
+        else:
+            df["vol_adj_zscore"] = 0.0
+    else:
+        df["vol_adj_zscore"] = df["vol_adj_return"]
+
     def _make_label(v):
         try:
-            if v is None:
+            if v is None or (hasattr(v, '__class__') and v != v):  # None or NaN
                 return None
             if v >= args.pct_threshold:
                 return 1
@@ -311,7 +325,9 @@ def train(args):
         except Exception:
             return None
 
-    df["label"] = df["vol_adj_return"].apply(_make_label)
+    # Apply threshold to the z-scored return so that e.g. --pct-threshold 1.0
+    # means "1 standard deviation above/below the cross-sectional mean"
+    df["label"] = df["vol_adj_zscore"].apply(_make_label)
 
     df.to_csv(out_dir / "step2_window.csv", index=False)
     print("Wrote step2_window.csv")
@@ -372,8 +388,10 @@ def train(args):
 
     # PHASE 1: Train the model on historical data to learn language patterns
     model_trained = False
+    # Drop rows where label is NaN (transcripts whose future return couldn't be computed)
+    train_df_historical = train_df_historical.dropna(subset=["label"]).copy()
     if not train_df_historical.empty:
-        unique_labels = train_df_historical["label"].dropna().unique()
+        unique_labels = train_df_historical["label"].unique()
         if len(unique_labels) < 2:
             print("warning: only one label in training data; skipping fit")
         else:
@@ -506,7 +524,9 @@ def train(args):
         # to see if our language patterns actually predictive
         test_df = test_df_future
     else:
-        test_df = pd.DataFrame()
+        # Model was not trained; still preserve raw future data in test_df
+        # so test.csv always contains the held-out transcripts for inspection
+        test_df = test_df_future
 
     # For backward compatibility with existing reporting, use learned labels
     if not test_df.empty and "learned_label" in test_df.columns:
