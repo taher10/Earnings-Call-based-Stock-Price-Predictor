@@ -313,7 +313,6 @@ class TextModel:
                         feats["full_sentiment"],
                         feats["mgmt_sentiment"],
                         feats["qa_sentiment"],
-                        feats["obfuscation_penalty"],
                         feats["numeric_count"],
                         float(feats.get("outlook_flag", 0)),
                         float(feats.get("qa_complexity", 0)),
@@ -373,7 +372,7 @@ class TextModel:
         """Prune meta-model features by zeroing out bottom 50% by coefficient magnitude.
         
         This reduces noise from weak features and stabilizes bootstrap variance.
-        Feature names: [full_sentiment, mgmt_sentiment, qa_sentiment, obfuscation_penalty,
+        Feature names: [full_sentiment, mgmt_sentiment, qa_sentiment,
                         numeric_count, outlook_flag, qa_complexity]
         """
         if self.meta_model is None:
@@ -398,8 +397,8 @@ class TextModel:
             # Report pruning statistics
             pruned_count = np.sum(~mask)
             kept_count = np.sum(mask)
-            feature_names = ["full_sentiment", "mgmt_sentiment", "qa_sentiment", 
-                           "obfuscation_penalty", "numeric_count", "outlook_flag", "qa_complexity"]
+            feature_names = ["full_sentiment", "mgmt_sentiment", "qa_sentiment",
+                           "numeric_count", "outlook_flag", "qa_complexity"]
             
             print(f"Feature importance pruning: kept {kept_count}, pruned {pruned_count} features (50th percentile)")
             print(f"  Kept features: {[feature_names[i] for i in range(len(mask)) if mask[i]]}")
@@ -931,7 +930,6 @@ class TextModel:
                         full_sentiment,
                         mgmt_sentiment,
                         qa_sentiment,
-                        obfuscation_penalty,
                         float(num_count),
                         float(outlook_flag),
                         float(qa_complexity),
